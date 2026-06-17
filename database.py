@@ -33,6 +33,12 @@ def _row(row) -> Optional[dict]:
 def _rows(rows) -> list[dict]:
     return [dict(r) for r in rows]
 
+async def _fetchone(db, sql, params=()):
+    """Portable execute+fetchone wrapper (aiosqlite 0.17-0.21 compatible)."""
+    cur = await db.execute(sql, params)
+    return await cur.fetchone()
+
+
 
 def _ref_code() -> str:
     chars = string.ascii_uppercase + string.digits
@@ -133,7 +139,7 @@ async def init_db() -> None:
 
 async def _seed_deposit_accounts() -> None:
     async with _conn() as db:
-        row = await db.execute_fetchone("SELECT COUNT(*) AS c FROM deposit_accounts")
+        row = await _fetchone(db, "SELECT COUNT(*) AS c FROM deposit_accounts")
         if row and row["c"] == 0:
             for acct in config.DEFAULT_TELEBIRR_ACCOUNTS:
                 await db.execute(
@@ -151,7 +157,7 @@ async def get_or_create_user(
     first_name: str = "",
 ) -> dict:
     async with _conn() as db:
-        row = _row(await db.execute_fetchone(
+        row = _row(await _fetchone(db, 
             "SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)
         ))
         if row:
@@ -171,14 +177,14 @@ async def get_or_create_user(
             (telegram_id, username, first_name, code)
         )
         await db.commit()
-        return _row(await db.execute_fetchone(
+        return _row(await _fetchone(db, 
             "SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)
         ))
 
 
 async def get_user(telegram_id: int) -> Optional[dict]:
     async with _conn() as db:
-        return _row(await db.execute_fetchone(
+        return _row(await _fetchone(db, 
             "SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)
         ))
 
@@ -186,14 +192,14 @@ async def get_user(telegram_id: int) -> Optional[dict]:
 async def get_user_by_username(username: str) -> Optional[dict]:
     uname = username.lstrip("@")
     async with _conn() as db:
-        return _row(await db.execute_fetchone(
+        return _row(await _fetchone(db, 
             "SELECT * FROM users WHERE LOWER(username) = LOWER(?)", (uname,)
         ))
 
 
 async def find_user_by_ref_code(code: str) -> Optional[dict]:
     async with _conn() as db:
-        return _row(await db.execute_fetchone(
+        return _row(await _fetchone(db, 
             "SELECT * FROM users WHERE referral_code=?", (code,)
         ))
 
@@ -239,7 +245,7 @@ async def add_balance(
             "UPDATE users SET balance = balance + ? WHERE telegram_id = ?",
             (amount, telegram_id)
         )
-        user_row = _row(await db.execute_fetchone(
+        user_row = _row(await _fetchone(db, 
             "SELECT id, balance FROM users WHERE telegram_id = ?", (telegram_id,)
         ))
         await db.execute(
@@ -259,7 +265,7 @@ async def deduct_balance(
     """Debit amount from user. Returns (success, new_balance)."""
     async with _conn() as db:
         await db.execute("BEGIN IMMEDIATE")
-        row = _row(await db.execute_fetchone(
+        row = _row(await _fetchone(db, 
             "SELECT id, balance FROM users WHERE telegram_id = ?", (telegram_id,)
         ))
         if not row or row["balance"] < amount - 0.001:
@@ -285,10 +291,10 @@ async def transfer_balance(
     """Atomic balance transfer. Returns (success, error_msg)."""
     async with _conn() as db:
         await db.execute("BEGIN IMMEDIATE")
-        fr = _row(await db.execute_fetchone(
+        fr = _row(await _fetchone(db, 
             "SELECT id, balance FROM users WHERE telegram_id=?", (from_tid,)
         ))
-        to = _row(await db.execute_fetchone(
+        to = _row(await _fetchone(db, 
             "SELECT id, balance FROM users WHERE telegram_id=?", (to_tid,)
         ))
         if not fr:
@@ -349,7 +355,7 @@ async def increment_account_deposits(account_id: int) -> None:
 
 async def is_ref_used(ref: str) -> bool:
     async with _conn() as db:
-        row = await db.execute_fetchone(
+        row = await _fetchone(db, 
             "SELECT 1 FROM used_tx_refs WHERE ref=?", (ref,)
         )
         return row is not None
@@ -396,7 +402,7 @@ async def create_game(room_fee: int) -> int:
 
 async def get_active_game(room_fee: int) -> Optional[dict]:
     async with _conn() as db:
-        return _row(await db.execute_fetchone(
+        return _row(await _fetchone(db, 
             "SELECT * FROM games WHERE room_fee=? AND status IN ('lobby','countdown','running') ORDER BY id DESC LIMIT 1",
             (room_fee,)
         ))
@@ -445,7 +451,7 @@ async def finish_game(
             (time.time(), json.dumps(winner_tids), prize_per_winner, house_cut, game_id)
         )
         for tid in winner_tids:
-            user = _row(await db.execute_fetchone(
+            user = _row(await _fetchone(db, 
                 "SELECT id FROM users WHERE telegram_id=?", (tid,)
             ))
             if user:
@@ -476,7 +482,7 @@ async def refund_game(game_id: int) -> list[tuple[int, float]]:
             "SELECT user_id, COUNT(*) as cnt FROM game_cards WHERE game_id=? GROUP BY user_id",
             (game_id,)
         )).fetchall())
-        game = _row(await db.execute_fetchone("SELECT room_fee FROM games WHERE id=?", (game_id,)))
+        game = _row(await _fetchone(db, "SELECT room_fee FROM games WHERE id=?", (game_id,)))
         if not game:
             return []
         fee = game["room_fee"]
@@ -484,7 +490,7 @@ async def refund_game(game_id: int) -> list[tuple[int, float]]:
         for card in cards:
             tid = card["user_id"]
             amount = card["cnt"] * fee
-            user = _row(await db.execute_fetchone(
+            user = _row(await _fetchone(db, 
                 "SELECT id FROM users WHERE telegram_id=?", (tid,)
             ))
             if user:
@@ -573,7 +579,7 @@ async def create_withdrawal(telegram_id: int, amount: float, phone: str) -> int:
     if not ok:
         raise ValueError("insufficient_balance")
     async with _conn() as db:
-        user = _row(await db.execute_fetchone(
+        user = _row(await _fetchone(db, 
             "SELECT id FROM users WHERE telegram_id=?", (telegram_id,)
         ))
         if not user:
@@ -598,7 +604,7 @@ async def get_pending_withdrawals() -> list[dict]:
 
 async def approve_withdrawal(wd_id: int) -> Optional[dict]:
     async with _conn() as db:
-        wd = _row(await db.execute_fetchone(
+        wd = _row(await _fetchone(db, 
             "SELECT * FROM withdrawals WHERE id=?", (wd_id,)
         ))
         if not wd or wd["status"] != "pending":
@@ -612,7 +618,7 @@ async def approve_withdrawal(wd_id: int) -> Optional[dict]:
 
 async def reject_withdrawal(wd_id: int) -> Optional[dict]:
     async with _conn() as db:
-        wd = _row(await db.execute_fetchone(
+        wd = _row(await _fetchone(db, 
             "SELECT * FROM withdrawals WHERE id=?", (wd_id,)
         ))
         if not wd or wd["status"] != "pending":
@@ -620,7 +626,7 @@ async def reject_withdrawal(wd_id: int) -> Optional[dict]:
         await db.execute(
             "UPDATE withdrawals SET status='rejected' WHERE id=?", (wd_id,)
         )
-        user = _row(await db.execute_fetchone(
+        user = _row(await _fetchone(db, 
             "SELECT id FROM users WHERE telegram_id=?", (wd["telegram_id"],)
         ))
         if user:
@@ -640,7 +646,7 @@ async def reject_withdrawal(wd_id: int) -> Optional[dict]:
 
 async def get_user_transactions(telegram_id: int, limit: int = 10) -> list[dict]:
     async with _conn() as db:
-        user = _row(await db.execute_fetchone(
+        user = _row(await _fetchone(db, 
             "SELECT id FROM users WHERE telegram_id=?", (telegram_id,)
         ))
         if not user:
@@ -656,19 +662,19 @@ async def get_user_transactions(telegram_id: int, limit: int = 10) -> list[dict]
 
 async def get_stats() -> dict:
     async with _conn() as db:
-        users = (await db.execute_fetchone("SELECT COUNT(*) AS c FROM users"))["c"]
-        games = (await db.execute_fetchone(
+        users = (await _fetchone(db, "SELECT COUNT(*) AS c FROM users"))["c"]
+        games = (await _fetchone(db, 
             "SELECT COUNT(*) AS c FROM games WHERE status='finished'"
         ))["c"]
-        collected_row = await db.execute_fetchone(
+        collected_row = await _fetchone(db, 
             "SELECT COALESCE(SUM(prize_pool),0) AS s FROM games WHERE status='finished'"
         )
         collected = collected_row["s"] if collected_row else 0.0
-        profit_row = await db.execute_fetchone(
+        profit_row = await _fetchone(db, 
             "SELECT COALESCE(SUM(house_cut),0) AS s FROM games WHERE status='finished'"
         )
         profit = profit_row["s"] if profit_row else 0.0
-        pending_wd = (await db.execute_fetchone(
+        pending_wd = (await _fetchone(db, 
             "SELECT COUNT(*) AS c FROM withdrawals WHERE status='pending'"
         ))["c"]
         return {
@@ -688,12 +694,12 @@ async def get_all_user_tids() -> list[int]:
 
 async def get_user_referral_count(telegram_id: int) -> int:
     async with _conn() as db:
-        user = _row(await db.execute_fetchone(
+        user = _row(await _fetchone(db, 
             "SELECT id FROM users WHERE telegram_id=?", (telegram_id,)
         ))
         if not user:
             return 0
-        row = await db.execute_fetchone(
+        row = await _fetchone(db, 
             "SELECT COUNT(*) AS c FROM users WHERE referred_by=?", (user["id"],)
         )
         return row["c"] if row else 0
@@ -702,10 +708,10 @@ async def get_user_referral_count(telegram_id: int) -> int:
 async def set_referred_by(new_user_tid: int, referrer_tid: int) -> None:
     """Record referral link. Awards bonus to both parties."""
     async with _conn() as db:
-        referrer = _row(await db.execute_fetchone(
+        referrer = _row(await _fetchone(db, 
             "SELECT id FROM users WHERE telegram_id=?", (referrer_tid,)
         ))
-        new_user = _row(await db.execute_fetchone(
+        new_user = _row(await _fetchone(db, 
             "SELECT id, referred_by FROM users WHERE telegram_id=?", (new_user_tid,)
         ))
         if not referrer or not new_user or new_user["referred_by"]:

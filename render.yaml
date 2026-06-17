@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: habesha-bingo-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt && cd webapp && npm install && npm run build
+    startCommand: python bot.py
+    envVars:
+      - key: HABESHA_BOT_TOKEN
+        sync: false
+      - key: HABESHA_ADMIN_ID
+        sync: false
+      - key: HABESHA_BOT_USERNAME
+        sync: false
+      - key: HABESHA_GROUP_LINK
+        sync: false
+      - key: HABESHA_CONTACT
+        sync: false

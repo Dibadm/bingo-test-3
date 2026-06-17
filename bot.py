@@ -1,1827 +1,1473 @@
-# bot.py
-# ============================================
-# HABESHA BET - MULTIPLAYER BINGO BOT
-# Main Telegram bot file.
-#
-# Architecture:
-#   - 4 permanent rooms (10/20/50/100 ETB), each always has a "waiting"
-#     or "running" game row (see database.get_or_create_active_game).
-#   - One asyncio task per running game drives the 60s countdown AND
-#     the number-calling loop (run_game_lifecycle). The task is started
-#     the moment the 2nd card is sold in a room and is tracked in
-#     ACTIVE_GAME_TASKS so a 2nd countdown can never be started for the
-#     same room while one is already running.
-#   - Every player who joins a game gets their OWN message that the
-#     lifecycle task edits directly (chat_id + message_id stored via
-#     database.upsert_game_player_message), so N players see N
-#     independently-updating live game screens from one shared call
-#     sequence.
-#   - Win checking: corners and line pay identically and split equally
-#     among all simultaneous winners (per product decision) - see
-#     resolve_round_end().
-#
-# HOW TO RUN:
-#   1. Fill in config.py (BOT_TOKEN, ADMIN_IDS, BOT_USERNAME, etc.)
-#   2. pip install -r requirements.txt
-#   3. python bot.py
-# ============================================
+#!/usr/bin/env python3
+"""
+bot.py — Habesha Bet Bingo Bot main module.
+python-telegram-bot v20 | asyncio | SQLite
+"""
 
 import asyncio
-import html
+import json
 import logging
 import os
+import random
+import time
 from datetime import datetime
+from typing import Optional
 
 from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    KeyboardButton,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
+    Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove,
+    WebAppInfo,
 )
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ConversationHandler,
-    ContextTypes,
-    filters,
-)
+from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden
+from telegram.ext import (
+    Application, ApplicationBuilder, CommandHandler, CallbackQueryHandler,
+    ConversationHandler, MessageHandler, ContextTypes, filters,
+)
 
 import config
 import database as db
-import bingo
-from locales import get_text, get_user_text, STRINGS
-from sms_parser import parse_telebirr_sms, verify_recipient, validate_deposit_amount
+from bingo import generate_unique_cards, check_win, render_card_text, render_number_grid, to_amharic
+from locales import get_text
+from sms_parser import parse_telebirr_sms, verify_recipient, verify_amount
 
+# ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
 
+# ── Conversation states ────────────────────────────────────────────────────────
+PHONE_INPUT = 10
+DEPOSIT_AMOUNT, DEPOSIT_SMS = 20, 21
+WITHDRAW_AMOUNT = 30
+TRANSFER_USER, TRANSFER_AMOUNT = 40, 41
+ADMIN_BROADCAST = 50
+ADMIN_ACCOUNTS = 51
 
-# =====================================================================
-# IN-MEMORY GAME STATE (per-process; resets on restart)
-# =====================================================================
-
-# room_fee -> asyncio.Task running that room's current countdown/game loop.
-# Used to guarantee only ONE lifecycle task per room at a time.
-ACTIVE_GAME_TASKS = {}
-
-# room_fee -> asyncio.Lock, guards "start a new lifecycle task for this room"
-# so two near-simultaneous card purchases can't both spawn a task.
-ROOM_LOCKS = {fee: asyncio.Lock() for fee in config.ROOM_FEES}
-
-# game_id -> {user_id: {card_index: win_type}} - populated by the manual
-# BINGO button handler (game_bingo_claim) the instant a valid claim is
-# pressed. The calling loop in run_game_lifecycle checks this dict after
-# every single call (not just its own auto-win check) so a manual press
-# is picked up within one CALL_DELAY_SECONDS window even if it happens
-# between calls rather than exactly when push_call_and_check_wins runs.
-GAME_MANUAL_CLAIMS = {}
-
-# Conversation states
-(
-    PHONE_COLLECT,
-    WITHDRAW_AMOUNT,
-    WITHDRAW_PHONE,
-    TRANSFER_USERNAME,
-    TRANSFER_AMOUNT,
-    DEPOSIT_CUSTOM_AMOUNT,
-    ADMIN_BROADCAST_WAIT,
-    ADMIN_ADD_ACCOUNT_PHONE,
-    ADMIN_ADD_ACCOUNT_NAME,
-) = range(9)
+# ── Global game state ──────────────────────────────────────────────────────────
+# One entry per room fee. Holds all volatile state for a running game.
+GAMES: dict[int, dict] = {}
 
 
-# =====================================================================
-# SMALL HELPERS
-# =====================================================================
+def _empty_room() -> dict:
+    return {
+        "game_id": None,
+        "status": "lobby",         # lobby | countdown | running | finished
+        "card_owners": {},          # {card_num: telegram_id}
+        "user_cards": {},           # {telegram_id: [card_num, ...]}
+        "all_card_grids": {},       # {card_num: grid}   populated at game start
+        "prize_pool": 0.0,
+        "called_numbers": [],
+        "participants": set(),
+        "countdown_task": None,
+        "call_task": None,
+        "auto_win_users": set(),    # telegram_ids with auto-win ON
+        "game_messages": {},        # {telegram_id: message_id}
+        "countdown_remaining": config.COUNTDOWN_SECONDS,
+        "last_buyer_name": "—",
+    }
 
-def lang_of(user_row) -> str:
-    return user_row["language"] if user_row and "language" in user_row.keys() else config.DEFAULT_LANGUAGE
+
+def _init_all_rooms() -> None:
+    for fee in config.ROOM_FEES:
+        GAMES[fee] = _empty_room()
 
 
-def display_name(user) -> str:
-    """Telegram User object -> a name to store/display before masking."""
-    return user.username or user.first_name or str(user.id)
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def lang(user: dict) -> str:
+    return user.get("language", "en")
 
 
-def safe_amount(text: str):
-    """Parse a user-typed amount string. Returns float or None."""
+def t(key: str, user: dict, **kw) -> str:
+    return get_text(key, lang(user), **kw)
+
+
+def mask_name(first: str, username: str) -> str:
+    if first:
+        return first[:1] + "***"
+    if username:
+        return "@" + username[:2] + "***"
+    return "***"
+
+
+async def safe_edit(bot: Bot, chat_id: int, message_id: int, text: str, markup=None) -> None:
     try:
-        value = float(text.strip().replace(",", ""))
-        if value <= 0:
-            return None
-        return round(value, 2)
-    except (ValueError, AttributeError):
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=markup,
+        )
+    except (BadRequest, Forbidden):
+        pass
+
+
+async def safe_send(bot: Bot, chat_id: int, text: str, markup=None) -> Optional[int]:
+    try:
+        msg = await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=markup,
+        )
+        return msg.message_id
+    except (BadRequest, Forbidden):
         return None
 
 
-async def safe_edit(query, text, reply_markup=None, parse_mode="HTML"):
-    """Edit a callback query's message, swallowing the extremely common
-    'Message is not modified' BadRequest that fires when the new text/
-    markup happens to be identical to what's already shown (this happens
-    constantly with live-updating game screens)."""
-    try:
-        await query.edit_message_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
-    except BadRequest as e:
-        if "not modified" not in str(e).lower():
-            logger.warning(f"safe_edit BadRequest: {e}")
+# ── UI builders ────────────────────────────────────────────────────────────────
 
-
-async def safe_edit_by_id(bot, chat_id, message_id, text, reply_markup=None, parse_mode="HTML"):
-    """Same as safe_edit but for editing an arbitrary (chat_id, message_id)
-    pair instead of a callback query's own message - needed because the
-    game lifecycle loop must push updates to EVERY player's message, not
-    just the one who triggered the action."""
-    try:
-        await bot.edit_message_text(
-            chat_id=chat_id, message_id=message_id, text=text,
-            parse_mode=parse_mode, reply_markup=reply_markup
-        )
-    except BadRequest as e:
-        if "not modified" not in str(e).lower():
-            logger.warning(f"safe_edit_by_id BadRequest ({chat_id}/{message_id}): {e}")
-    except Forbidden:
-        logger.info(f"User {chat_id} blocked the bot - skipping update")
-
-
-def fmt(amount) -> str:
-    """Consistent ETB amount formatting - no trailing .0 noise for whole numbers."""
-    if amount == int(amount):
-        return str(int(amount))
-    return f"{amount:.2f}"
-
-
-# =====================================================================
-# KEYBOARDS
-# =====================================================================
-
-def main_menu_keyboard(lang) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(get_text("btn_play_games", lang), callback_data="menu_play")],
-        [
-            InlineKeyboardButton(get_text("btn_deposit", lang), callback_data="menu_deposit"),
-            InlineKeyboardButton(get_text("btn_withdraw", lang), callback_data="menu_withdraw"),
-        ],
-        [
-            InlineKeyboardButton(get_text("btn_transfer", lang), callback_data="menu_transfer"),
-            InlineKeyboardButton(get_text("btn_profile", lang), callback_data="menu_profile"),
-        ],
-        [
-            InlineKeyboardButton(get_text("btn_transactions", lang), callback_data="menu_transactions"),
-            InlineKeyboardButton(get_text("btn_balance", lang), callback_data="menu_balance"),
-        ],
-        [
-            InlineKeyboardButton(get_text("btn_join_group", lang), url=config.GROUP_LINK),
-            InlineKeyboardButton(get_text("btn_contact", lang), url=f"https://t.me/{config.SUPPORT_USERNAME}"),
-        ],
-        [InlineKeyboardButton(get_text("btn_refer", lang), callback_data="menu_referral")],
-        [
-            InlineKeyboardButton(get_text("btn_daily_bonus", lang), callback_data="menu_bonus"),
-            InlineKeyboardButton(get_text("btn_language", lang), callback_data="menu_language"),
-        ],
-    ])
-
-
-def back_keyboard(lang) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton(get_text("btn_back", lang), callback_data="back_main")]])
-
-
-def games_menu_keyboard(lang) -> InlineKeyboardMarkup:
-    bingo_count = sum(len(db.get_game_players(db.get_or_create_active_game(fee)["id"])) for fee in config.ROOM_FEES)
-    bingo_label = f"{get_text('btn_bingo', lang)} 🟢{bingo_count}"
-
+def main_menu_markup(user: dict) -> InlineKeyboardMarkup:
+    L = lang(user)
     rows = [
-        [InlineKeyboardButton(bingo_label, callback_data="games_bingo")],
+        [InlineKeyboardButton(get_text("btn_play", L), callback_data="games")],
         [
-            InlineKeyboardButton(f"{get_text('btn_ludo', lang)} ({get_text('coming_soon', lang)})", callback_data="noop"),
-            InlineKeyboardButton(f"{get_text('btn_cards', lang)} ({get_text('coming_soon', lang)})", callback_data="noop"),
+            InlineKeyboardButton(get_text("btn_deposit", L), callback_data="deposit"),
+            InlineKeyboardButton(get_text("btn_withdraw", L), callback_data="withdraw"),
         ],
-        [InlineKeyboardButton(f"{get_text('btn_conquer', lang)} ({get_text('coming_soon', lang)})", callback_data="noop")],
-        [InlineKeyboardButton(get_text("btn_back", lang), callback_data="back_main")],
+        [
+            InlineKeyboardButton(get_text("btn_transfer", L), callback_data="transfer"),
+            InlineKeyboardButton(get_text("btn_profile", L), callback_data="profile"),
+        ],
+        [
+            InlineKeyboardButton(get_text("btn_transactions", L), callback_data="transactions"),
+            InlineKeyboardButton(get_text("btn_balance", L), callback_data="balance"),
+        ],
+        [
+            InlineKeyboardButton(get_text("btn_group", L), url=config.GROUP_LINK),
+            InlineKeyboardButton(get_text("btn_contact", L), url=f"https://t.me/{config.CONTACT_USERNAME.lstrip('@')}"),
+        ],
+        [
+            InlineKeyboardButton(get_text("btn_refer", L), callback_data="referral"),
+            InlineKeyboardButton(get_text("btn_language", L), callback_data="toggle_lang"),
+        ],
     ]
     return InlineKeyboardMarkup(rows)
 
 
-def rooms_keyboard(lang) -> InlineKeyboardMarkup:
+def rooms_markup(user: dict) -> InlineKeyboardMarkup:
+    L = lang(user)
     rows = []
     for fee in config.ROOM_FEES:
-        game = db.get_or_create_active_game(fee)
-        pool = fmt(game["pool"])
-        players = len(db.get_game_players(game["id"]))
-        label = get_text("room_btn", lang, fee=fmt(fee), pool=pool, players=players)
-        rows.append([InlineKeyboardButton(label, callback_data=f"room_{fee}")])
-    rows.append([InlineKeyboardButton(get_text("btn_back", lang), callback_data="menu_play")])
+        g = GAMES[fee]
+        pool = round(g["prize_pool"] * (1 - config.HOUSE_COMMISSION), 2)
+        sold = len(g["card_owners"])
+        rows.append([InlineKeyboardButton(
+            f"🎯 {fee} ETB | 🏆 {pool} ETB | 👥 {sold} cards",
+            callback_data=f"room:{fee}",
+        )])
+    rows.append([InlineKeyboardButton(get_text("btn_back", L), callback_data="main_menu")])
     return InlineKeyboardMarkup(rows)
 
 
-CARDS_PER_PAGE = 40  # 4 rows x 10 columns
+def card_selection_markup(
+    room_fee: int,
+    page: int,
+    user_tid: int,
+    user: dict,
+) -> InlineKeyboardMarkup:
+    """Build the paginated card selection keyboard."""
+    L = lang(user)
+    g = GAMES[room_fee]
+    card_owners = g["card_owners"]
+    my_cards = set(g["user_cards"].get(user_tid, []))
 
+    per_page = config.CARDS_PER_PAGE   # 50
+    total_pages = (config.TOTAL_CARDS + per_page - 1) // per_page  # 4
+    start = page * per_page + 1
+    end = min(start + per_page - 1, config.TOTAL_CARDS)
 
-def build_card_page_keyboard(game_id, room_fee, lang, page, selected_indices):
-    """Render one page (40 cards) of the 200-card grid as inline buttons.
-    selected_indices = the cards THIS user has tapped in the current
-    session but not yet purchased (kept in context.user_data, not DB,
-    until the START button is pressed)."""
-    taken = db.get_taken_cards(game_id)
-    total_pages = (config.CARD_POOL_SIZE + CARDS_PER_PAGE - 1) // CARDS_PER_PAGE
-    start = page * CARDS_PER_PAGE
-    end = min(start + CARDS_PER_PAGE, config.CARD_POOL_SIZE)
-
-    rows = []
-    row = []
-    for idx in range(start, end):
-        display_num = idx + 1
-        if idx in taken:
-            text = f"⬛{display_num}"
-        elif idx in selected_indices:
-            text = f"✅{display_num}"
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for card_num in range(start, end + 1):
+        owner = card_owners.get(card_num)
+        if card_num in my_cards:
+            label = f"✅{card_num}"
+        elif owner is not None:
+            label = f"⬛{card_num}"
         else:
-            text = str(display_num)
-        row.append(InlineKeyboardButton(text, callback_data=f"cardtap_{idx}"))
+            label = str(card_num)
+        row.append(InlineKeyboardButton(
+            label,
+            callback_data=f"card_toggle:{room_fee}:{card_num}:{page}",
+        ))
         if len(row) == 10:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
 
-    # Pager row
-    pager = []
+    # Navigation
+    nav = []
     if page > 0:
-        pager.append(InlineKeyboardButton("⬅️", callback_data=f"cardpage_{page-1}"))
-    pager.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"))
+        nav.append(InlineKeyboardButton("◀", callback_data=f"card_page:{room_fee}:{page-1}"))
+    nav.append(InlineKeyboardButton(f"📄{page+1}/{total_pages}", callback_data="noop"))
     if page < total_pages - 1:
-        pager.append(InlineKeyboardButton("➡️", callback_data=f"cardpage_{page+1}"))
-    rows.append(pager)
+        nav.append(InlineKeyboardButton("▶", callback_data=f"card_page:{room_fee}:{page+1}"))
+    rows.append(nav)
 
-    # Random pick + start row
-    rows.append([
-        InlineKeyboardButton(get_text("btn_random_x1", lang), callback_data="random_1"),
-        InlineKeyboardButton(get_text("btn_random_x2", lang), callback_data="random_2"),
-    ])
-
-    cost = len(selected_indices) * room_fee
-    start_label = get_text("btn_start_cost", lang, cost=fmt(cost)) if selected_indices else get_text("btn_start_game", lang)
-    rows.append([InlineKeyboardButton(start_label, callback_data="confirm_purchase")])
-    rows.append([InlineKeyboardButton(get_text("btn_back", lang), callback_data="menu_play")])
-
+    # Actions
+    n_sel = len(my_cards)
+    cost = n_sel * room_fee
+    action_row = [
+        InlineKeyboardButton("🎲 x1", callback_data=f"rand_card:{room_fee}:{page}:1"),
+        InlineKeyboardButton("🎲 x2", callback_data=f"rand_card:{room_fee}:{page}:2"),
+    ]
+    if n_sel > 0:
+        action_row.append(InlineKeyboardButton(
+            f"▶️ START! ({n_sel}×{room_fee}={cost}ETB)",
+            callback_data=f"buy_cards:{room_fee}",
+        ))
+    rows.append(action_row)
+    rows.append([InlineKeyboardButton(get_text("btn_back", L), callback_data="rooms")])
     return InlineKeyboardMarkup(rows)
 
 
-def active_game_keyboard(lang, auto_win_on: bool, marked_count: int = 0, total_called: int = 0) -> InlineKeyboardMarkup:
-    auto_label = get_text("auto_win_on", lang) if auto_win_on else get_text("auto_win_off", lang)
-    check_label = get_text("btn_check_all", lang, n=marked_count, total=total_called)
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(check_label, callback_data="game_check")],
+def card_selection_text(room_fee: int, user_tid: int, user: dict) -> str:
+    g = GAMES[room_fee]
+    sold = len(g["card_owners"])
+    pool = round(g["prize_pool"] * (1 - config.HOUSE_COMMISSION), 2)
+    timer = g["countdown_remaining"] if g["status"] == "countdown" else "—"
+    return t("card_selection", user,
+             fee=room_fee,
+             balance=round(user.get("balance", 0), 2),
+             pool=pool,
+             sold=sold,
+             timer=timer,
+             last=g["last_buyer_name"],
+             max=config.MAX_CARDS_PER_PLAYER)
+
+
+def game_screen_text(room_fee: int, user: dict) -> str:
+    g = GAMES[room_fee]
+    called = g["called_numbers"]
+    last_num = called[-1] if called else "—"
+    grid_html = render_number_grid(called)
+    pool = round(g["prize_pool"] * (1 - config.HOUSE_COMMISSION), 2)
+    return t("game_screen", user,
+             fee=room_fee,
+             pool=pool,
+             players=len(g["participants"]),
+             called=len(called),
+             last_num=last_num,
+             number_grid=grid_html)
+
+
+def game_screen_markup(room_fee: int, user_tid: int, user: dict) -> InlineKeyboardMarkup:
+    g = GAMES[room_fee]
+    L = lang(user)
+    my_cards = g["user_cards"].get(user_tid, [])
+    called_set = set(g["called_numbers"])
+    # Count marked cells across all user cards
+    marked_total = 0
+    total_cells = 0
+    for card_num in my_cards:
+        grid = g["all_card_grids"].get(card_num, [])
+        for row in grid:
+            for n in row:
+                total_cells += 1
+                if n == 0 or n in called_set:
+                    marked_total += 1
+
+    auto_on = user_tid in g["auto_win_users"]
+    auto_lbl = get_text("btn_auto_on" if auto_on else "btn_auto_off", L)
+    rows = [
         [
-            InlineKeyboardButton(auto_label, callback_data="game_toggle_auto"),
-            InlineKeyboardButton(get_text("btn_bingo_claim", lang), callback_data="game_bingo_claim"),
+            InlineKeyboardButton(auto_lbl, callback_data=f"auto_win:{room_fee}"),
+            InlineKeyboardButton(
+                get_text("btn_check", L, n=marked_total, total=total_cells),
+                callback_data=f"check_win:{room_fee}",
+            ),
         ],
-    ])
-
-
-def play_again_keyboard(lang, room_fee) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(get_text("btn_play_again", lang), callback_data=f"room_{room_fee}")],
-        [InlineKeyboardButton(get_text("btn_back", lang), callback_data="back_main")],
-    ])
-
-
-def language_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🇬🇧 English", callback_data="lang_en"),
-            InlineKeyboardButton("🇪🇹 አማርኛ", callback_data="lang_am"),
-        ],
-        [InlineKeyboardButton("🔙 Back", callback_data="back_main")],
-    ])
-
-
-def deposit_amount_keyboard(lang) -> InlineKeyboardMarkup:
-    rows = []
-    row = []
-    for amt in config.DEPOSIT_QUICK_AMOUNTS:
-        row.append(InlineKeyboardButton(f"{amt} ETB", callback_data=f"depamt_{amt}"))
-        if len(row) == 3:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    rows.append([InlineKeyboardButton(get_text("btn_custom_amount", lang), callback_data="depamt_custom")])
-    rows.append([InlineKeyboardButton(get_text("btn_back", lang), callback_data="back_main")])
+        [InlineKeyboardButton(get_text("btn_bingo", L), callback_data=f"claim_bingo:{room_fee}")],
+    ]
     return InlineKeyboardMarkup(rows)
 
 
-def withdraw_approval_keyboard(withdrawal_id) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Approve", callback_data=f"wdapprove_{withdrawal_id}"),
-        InlineKeyboardButton("❌ Reject", callback_data=f"wdreject_{withdrawal_id}"),
-    ]])
+# ── Game engine ────────────────────────────────────────────────────────────────
+
+async def ensure_game_for_room(app: Application, room_fee: int) -> int:
+    """Make sure a lobby game exists for the room in DB and memory. Returns game_id."""
+    g = GAMES[room_fee]
+    if g["game_id"] is None:
+        game_id = await db.create_game(room_fee)
+        g["game_id"] = game_id
+        # Pre-generate all 200 card grids for this game
+        cards = generate_unique_cards(config.TOTAL_CARDS, seed=game_id * 1000 + room_fee)
+        g["all_card_grids"] = {i + 1: cards[i] for i in range(config.TOTAL_CARDS)}
+    return g["game_id"]
 
 
-def admin_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Dashboard", callback_data="admin_dashboard")],
-        [InlineKeyboardButton("💸 Withdrawals", callback_data="admin_withdrawals")],
-        [InlineKeyboardButton("🏦 Deposit Accounts", callback_data="admin_accounts")],
-        [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")],
-        [InlineKeyboardButton("🏛️ House Wallet", callback_data="admin_house")],
-    ])
-
-
-# =====================================================================
-# /start  +  PHONE COLLECTION  (referral deep links: t.me/bot?start=ref123456)
-# =====================================================================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    existing = db.get_user(user.id)
-    is_new = existing is None
-
-    referred_by = None
-    if context.args:
-        arg = context.args[0]
-        if arg.startswith("ref"):
-            try:
-                ref_id = int(arg[3:])
-                if ref_id != user.id and db.get_user(ref_id) is not None:
-                    referred_by = ref_id
-            except ValueError:
-                pass
-
-    db_user = db.get_or_create_user(user.id, display_name(user), referred_by=referred_by)
-    lang = lang_of(db_user)
-
-    if is_new or not db_user["phone"]:
-        # Must collect phone before anything else (needed for withdrawals)
-        contact_button = KeyboardButton(get_text("share_phone_button", lang), request_contact=True)
-        keyboard = ReplyKeyboardMarkup([[contact_button]], resize_keyboard=True, one_time_keyboard=True)
-        await update.message.reply_text(
-            get_text("welcome_new", lang), parse_mode="HTML", reply_markup=keyboard
-        )
-        return PHONE_COLLECT
-
-    await show_main_menu(update, context, db_user)
-    return ConversationHandler.END
-
-
-async def phone_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    contact = update.message.contact
-
-    if contact is None or contact.user_id != user.id:
-        # Reject contacts shared on behalf of someone else
-        db_user = db.get_user(user.id)
-        lang = lang_of(db_user)
-        await update.message.reply_text(get_text("share_phone_button", lang))
-        return PHONE_COLLECT
-
-    db.set_user_phone(user.id, contact.phone_number)
-    db_user = db.get_user(user.id)
-    lang = lang_of(db_user)
-
-    prefix = ""
-    if db_user["referred_by"] is not None and config.SIGNUP_BONUS > 0:
-        db.adjust_balance(user.id, config.SIGNUP_BONUS)
-        db.record_transaction(user.id, "signup_bonus", config.SIGNUP_BONUS, status="completed")
-        prefix = get_text("signup_bonus_received", lang, amount=fmt(config.SIGNUP_BONUS))
-
-    await update.message.reply_text(
-        prefix + get_text("phone_saved", lang), parse_mode="HTML", reply_markup=ReplyKeyboardRemove()
+async def start_countdown(app: Application, room_fee: int) -> None:
+    g = GAMES[room_fee]
+    if g["status"] == "countdown" and g["countdown_task"]:
+        return  # Already counting
+    g["status"] = "countdown"
+    g["countdown_task"] = asyncio.create_task(
+        _countdown_loop(app, room_fee)
     )
 
-    db_user = db.get_user(user.id)
-    await show_main_menu(update, context, db_user)
-    return ConversationHandler.END
 
+async def _countdown_loop(app: Application, room_fee: int) -> None:
+    g = GAMES[room_fee]
+    for remaining in range(config.COUNTDOWN_SECONDS, -1, -1):
+        if GAMES[room_fee]["status"] != "countdown":
+            return
+        GAMES[room_fee]["countdown_remaining"] = remaining
 
-async def show_main_menu(update_or_query, context, db_user, edit=False):
-    lang = lang_of(db_user)
-    text = get_text(
-        "main_menu_text", lang,
-        username=html.escape(db_user["username"] or str(db_user["user_id"])),
-        balance=fmt(db_user["balance"]),
-    )
-    markup = main_menu_keyboard(lang)
+        # Broadcast countdown update every 10 seconds + last 5
+        if remaining % 10 == 0 or remaining <= 5:
+            await _broadcast_lobby_update(app, room_fee)
 
-    if edit:
-        await safe_edit(update_or_query, text, reply_markup=markup)
+        if remaining == 0:
+            break
+        await asyncio.sleep(1)
+
+    # Time's up
+    g = GAMES[room_fee]
+    sold = len(g["card_owners"])
+    if sold < config.MIN_CARDS_TO_START:
+        await _refund_and_reset(app, room_fee)
     else:
-        await update_or_query.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
+        await _begin_game(app, room_fee)
 
 
-# =====================================================================
-# MAIN MENU CALLBACKS
-# =====================================================================
+async def _broadcast_lobby_update(app: Application, room_fee: int) -> None:
+    g = GAMES[room_fee]
+    for tid in list(g["participants"]):
+        user = await db.get_user(tid)
+        if not user:
+            continue
+        msg_id = g["game_messages"].get(tid)
+        text = card_selection_text(room_fee, tid, user)
+        markup = card_selection_markup(room_fee, 0, tid, user)
+        if msg_id:
+            await safe_edit(app.bot, tid, msg_id, text, markup)
 
-async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = update.effective_user
-    db_user = db.get_user(user.id)
-    if db_user is None:
-        await query.answer(get_text("error_generic", config.DEFAULT_LANGUAGE), show_alert=True)
+
+async def _refund_and_reset(app: Application, room_fee: int) -> None:
+    g = GAMES[room_fee]
+    game_id = g["game_id"]
+    refunds = await db.refund_game(game_id)
+    for (tid, amount) in refunds:
+        user = await db.get_user(tid)
+        if user:
+            await safe_send(app.bot, tid,
+                            t("lobby_refund", user, amount=amount))
+    # Reset room
+    GAMES[room_fee] = _empty_room()
+
+
+async def _begin_game(app: Application, room_fee: int) -> None:
+    g = GAMES[room_fee]
+    await db.set_game_status(g["game_id"], "running")
+    g["status"] = "running"
+    g["called_numbers"] = []
+
+    # Notify all players
+    for tid in list(g["participants"]):
+        user = await db.get_user(tid)
+        if not user:
+            continue
+        await safe_send(app.bot, tid, t("game_starting", user))
+
+    g["call_task"] = asyncio.create_task(_call_loop(app, room_fee))
+
+
+async def _call_loop(app: Application, room_fee: int) -> None:
+    """Call numbers 1-75 in random order every CALL_INTERVAL seconds."""
+    g = GAMES[room_fee]
+    numbers = list(range(1, 76))
+    random.shuffle(numbers)
+
+    for num in numbers:
+        if GAMES[room_fee]["status"] != "running":
+            return
+
+        GAMES[room_fee]["called_numbers"].append(num)
+        await db.update_called_numbers(g["game_id"], GAMES[room_fee]["called_numbers"])
+
+        called_set = set(GAMES[room_fee]["called_numbers"])
+
+        # Auto-win check
+        winners = _find_winners(room_fee, called_set)
+        if winners:
+            await _finish_game(app, room_fee, winners)
+            return
+
+        # Broadcast
+        await _broadcast_game_update(app, room_fee, num)
+        await asyncio.sleep(config.CALL_INTERVAL_SECONDS)
+
+    # All 75 numbers called with no winner → refund
+    await _finish_game(app, room_fee, [])
+
+
+def _find_winners(room_fee: int, called: set[int]) -> list[tuple[int, int, str]]:
+    """
+    Returns list of (telegram_id, card_number, win_type) for all winning cards.
+    Only checks auto-win users (manual wins are handled by claim_bingo handler).
+    Actually for auto-win: checks ALL participants' cards continuously.
+    """
+    g = GAMES[room_fee]
+    winners = []
+    for tid in g["auto_win_users"]:
+        my_cards = g["user_cards"].get(tid, [])
+        for card_num in my_cards:
+            grid = g["all_card_grids"].get(card_num)
+            if not grid:
+                continue
+            won, win_type = check_win(grid, called)
+            if won:
+                winners.append((tid, card_num, win_type))
+    return winners
+
+
+async def _finish_game(
+    app: Application,
+    room_fee: int,
+    winners: list[tuple[int, int, str]],
+) -> None:
+    g = GAMES[room_fee]
+    if g["status"] == "finished":
         return
-    lang = lang_of(db_user)
-    data = query.data
+    g["status"] = "finished"
 
-    if data == "back_main":
-        db_user = db.get_user(user.id)  # refresh balance
-        await show_main_menu(query, context, db_user, edit=True)
+    game_id = g["game_id"]
+    total_pool = g["prize_pool"]
+    house_cut = round(total_pool * config.HOUSE_COMMISSION, 2)
+    prize_pool_net = round(total_pool - house_cut, 2)
 
-    elif data == "menu_balance":
-        await safe_edit(
-            query,
-            get_text("main_menu_text", lang, username=html.escape(db_user["username"] or ""), balance=fmt(db_user["balance"])),
-            reply_markup=back_keyboard(lang),
-        )
-
-    elif data == "menu_profile":
-        joined_date = db_user["created_at"][:10] if db_user["created_at"] else "-"
-        text = get_text(
-            "profile_text", lang,
-            username=html.escape(db_user["username"] or ""),
-            user_id=db_user["user_id"],
-            phone=db_user["phone"] or "-",
-            balance=fmt(db_user["balance"]),
-            referrals=db.count_referrals(user.id),
-            joined=joined_date,
-        )
-        await safe_edit(query, text, reply_markup=back_keyboard(lang))
-
-    elif data == "menu_transactions":
-        await show_transactions(query, db_user)
-
-    elif data == "menu_bonus":
-        await handle_daily_bonus(query, db_user)
-
-    elif data == "menu_referral":
-        await handle_referral_info(query, db_user)
-
-    elif data == "menu_language":
-        await safe_edit(query, "🌐 Language / ቋንቋ", reply_markup=language_keyboard())
-
-    elif data == "lang_en":
-        db.set_user_language(user.id, "en")
-        await query.answer(get_text("language_switched_en", "en"))
-        await show_main_menu(query, context, db.get_user(user.id), edit=True)
-
-    elif data == "lang_am":
-        db.set_user_language(user.id, "am")
-        await query.answer(get_text("language_switched_am", "am"))
-        await show_main_menu(query, context, db.get_user(user.id), edit=True)
-
-    elif data == "menu_play":
-        await safe_edit(query, get_text("games_menu_text", lang), reply_markup=games_menu_keyboard(lang))
-
-    elif data == "menu_deposit":
-        await menu_deposit_entry(query, context, db_user)
-
-    elif data == "games_bingo":
-        await safe_edit(query, get_text("bingo_rooms_text", lang), reply_markup=rooms_keyboard(lang))
-
-    elif data == "noop":
-        pass  # disabled / coming-soon buttons, or pager page-count label
-
-    elif data.startswith("room_"):
-        fee = float(data.split("_", 1)[1])
-        await enter_room(query, context, db_user, fee)
-
-    elif data.startswith("cardpage_"):
-        page = int(data.split("_", 1)[1])
-        await show_card_page(query, context, db_user, page)
-
-    elif data.startswith("cardtap_"):
-        idx = int(data.split("_", 1)[1])
-        await toggle_card_selection(query, context, db_user, idx)
-
-    elif data.startswith("random_"):
-        count = int(data.split("_", 1)[1])
-        await random_pick(query, context, db_user, count)
-
-    elif data == "confirm_purchase":
-        await confirm_purchase(query, context, db_user)
-
-    elif data == "game_check":
-        await game_check_all(query, context, db_user)
-
-    elif data == "game_toggle_auto":
-        await game_toggle_auto(query, context, db_user)
-
-    elif data == "game_bingo_claim":
-        await game_bingo_claim(query, context, db_user)
-
-    elif data.startswith("depamt_"):
-        await deposit_amount_chosen(query, context, db_user, data)
-
-    elif data.startswith("wdapprove_"):
-        await admin_approve_withdrawal(query, context, int(data.split("_", 1)[1]))
-
-    elif data.startswith("wdreject_"):
-        await admin_reject_withdrawal(query, context, int(data.split("_", 1)[1]))
-
-    elif data.startswith("admin_"):
-        await admin_callback(query, context, db_user, data)
-
-
-TX_ICONS = {
-    "deposit": "💳", "withdraw": "💸", "withdraw_refund": "↩️", "transfer_in": "📥", "transfer_out": "📤",
-    "bingo_bet": "🎲", "bingo_win": "🏆", "bingo_refund": "↩️",
-    "referral_bonus": "👥", "signup_bonus": "🎁", "daily_bonus": "🎁",
-    "house_commission": "🏛️",
-}
-
-
-async def show_transactions(query, db_user):
-    lang = lang_of(db_user)
-    rows = db.get_user_transactions(db_user["user_id"], limit=10)
-
-    if not rows:
-        await safe_edit(query, get_text("no_transactions", lang), reply_markup=back_keyboard(lang))
+    if not winners:
+        # No one won → refund
+        refunds = await db.refund_game(game_id)
+        for (tid, amount) in refunds:
+            user = await db.get_user(tid)
+            if user:
+                await safe_send(app.bot, tid, t("no_winner_refund", user))
+        GAMES[room_fee] = _empty_room()
+        asyncio.create_task(_schedule_new_lobby(app, room_fee, 10))
         return
 
-    lines = [get_text("transactions_header", lang)]
-    for r in rows:
-        key = f"tx_type_{r['type']}"
-        type_label = get_text(key, lang) if key in STRINGS else r["type"]
-        icon = TX_ICONS.get(r["type"], "•")
-        sign = "+" if r["amount"] >= 0 else ""
-        lines.append(get_text(
-            "tx_row", lang,
-            icon=icon, type_label=type_label, sign=sign, amount=fmt(abs(r["amount"])),
-            date=r["created_at"][:16].replace("T", " "),
+    # Multiple winners split the pot
+    winner_tids = list({w[0] for w in winners})
+    prize_each = round(prize_pool_net / len(winner_tids), 2)
+
+    await db.finish_game(game_id, winner_tids, prize_each, house_cut)
+    for (wid, card_num, win_type) in winners:
+        await db.mark_card_winner(game_id, card_num, win_type)
+
+    win_type_label_key = "win_type_line" if winners[0][2] == "line" else "win_type_corners"
+
+    # Notify all players
+    for tid in list(g["participants"]):
+        user = await db.get_user(tid)
+        if not user:
+            continue
+        if tid in winner_tids:
+            # This player won
+            my_winning = [w for w in winners if w[0] == tid]
+            card_num = my_winning[0][1]
+            await safe_send(app.bot, tid,
+                            t("you_won", user,
+                              card=card_num,
+                              win_type=get_text(win_type_label_key, lang(user)),
+                              prize=prize_each),
+                            markup=InlineKeyboardMarkup([[
+                                InlineKeyboardButton(
+                                    get_text("btn_play_again", lang(user)),
+                                    callback_data="rooms",
+                                )
+                            ]]))
+        else:
+            winner_user = await db.get_user(winner_tids[0])
+            wname = mask_name(
+                winner_user.get("first_name", "") if winner_user else "",
+                winner_user.get("username", "") if winner_user else "",
+            )
+            my_win_card = next((w[1] for w in winners if w[0] == winner_tids[0]), 0)
+            await safe_send(app.bot, tid,
+                            t("someone_won", user,
+                              winner=wname,
+                              card=my_win_card,
+                              win_type=get_text(win_type_label_key, lang(user)),
+                              prize=prize_each),
+                            markup=InlineKeyboardMarkup([[
+                                InlineKeyboardButton(
+                                    get_text("btn_play_again", lang(user)),
+                                    callback_data="rooms",
+                                )
+                            ]]))
+
+    GAMES[room_fee] = _empty_room()
+    asyncio.create_task(_schedule_new_lobby(app, room_fee, 10))
+
+
+async def _schedule_new_lobby(app: Application, room_fee: int, delay: int) -> None:
+    await asyncio.sleep(delay)
+    await ensure_game_for_room(app, room_fee)
+
+
+async def _broadcast_game_update(app: Application, room_fee: int, new_num: int) -> None:
+    g = GAMES[room_fee]
+    for tid in list(g["participants"]):
+        user = await db.get_user(tid)
+        if not user:
+            continue
+        text = game_screen_text(room_fee, user)
+        markup = game_screen_markup(room_fee, tid, user)
+        msg_id = g["game_messages"].get(tid)
+        if msg_id:
+            await safe_edit(app.bot, tid, msg_id, text, markup)
+        else:
+            new_id = await safe_send(app.bot, tid, text, markup)
+            if new_id:
+                g["game_messages"][tid] = new_id
+
+
+# ── /start ─────────────────────────────────────────────────────────────────────
+
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    tg = update.effective_user
+    user = await db.get_or_create_user(tg.id, tg.username or "", tg.first_name or "")
+
+    # Handle referral: /start REF_CODE
+    if ctx.args and not user.get("referred_by"):
+        ref_code = ctx.args[0]
+        referrer = await _find_user_by_ref(ref_code)
+        if referrer and referrer["telegram_id"] != tg.id:
+            await db.set_referred_by(tg.id, referrer["telegram_id"])
+            # Notify referrer
+            ref_user = await db.get_user(referrer["telegram_id"])
+            if ref_user:
+                await safe_send(
+                    ctx.bot, referrer["telegram_id"],
+                    t("referral_bonus_received", ref_user, bonus=config.REFERRAL_BONUS)
+                )
+
+    if not user.get("phone"):
+        await update.message.reply_text(
+            t("ask_phone", user),
+            reply_markup=ReplyKeyboardMarkup(
+                [[KeyboardButton("📱 Share Phone", request_contact=True)]],
+                resize_keyboard=True, one_time_keyboard=True,
+            )
+        )
+        return PHONE_INPUT
+
+    # Refresh user after possible referral bonus
+    user = await db.get_user(tg.id)
+    await update.message.reply_text(
+        t("main_menu", user, balance=round(user["balance"], 2)),
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_markup(user),
+    )
+    return ConversationHandler.END
+
+
+async def _find_user_by_ref(code: str):
+    import aiosqlite as _aiosqlite
+    async with await db._conn() as conn:
+        return db._row(await conn.execute_fetchone(
+            "SELECT * FROM users WHERE referral_code=?", (code,)
         ))
 
-    await safe_edit(query, "\n".join(lines), reply_markup=back_keyboard(lang))
 
-
-async def handle_daily_bonus(query, db_user):
-    lang = lang_of(db_user)
-    user_id = db_user["user_id"]
-    can_claim, hours_remaining = db.can_claim_daily_bonus(user_id)
-
-    if can_claim:
-        balance = db.adjust_balance(user_id, config.DAILY_BONUS_AMOUNT)
-        db.record_transaction(user_id, "daily_bonus", config.DAILY_BONUS_AMOUNT, status="completed")
-        db.set_daily_bonus_claimed(user_id)
-        await safe_edit(
-            query,
-            get_text("daily_bonus_claimed", lang, amount=fmt(config.DAILY_BONUS_AMOUNT), balance=fmt(balance)),
-            reply_markup=back_keyboard(lang),
-        )
-    else:
-        await safe_edit(query, get_text("daily_bonus_wait", lang, hours=hours_remaining), reply_markup=back_keyboard(lang))
-
-
-async def handle_referral_info(query, db_user):
-    lang = lang_of(db_user)
-    user_id = db_user["user_id"]
-    link = f"https://t.me/{config.BOT_USERNAME}?start=ref{user_id}"
-    count = db.count_referrals(user_id)
-    await safe_edit(
-        query,
-        get_text(
-            "referral_info", lang, link=link,
-            signup_bonus=fmt(config.SIGNUP_BONUS), referral_bonus=fmt(config.REFERRAL_BONUS), count=count,
-        ),
-        reply_markup=back_keyboard(lang),
-    )
-
-
-# =====================================================================
-# ROOM ENTRY / CARD SELECTION / PURCHASE
-# =====================================================================
-
-def _selection_key(room_fee):
-    return f"selected_cards_{room_fee}"
-
-
-async def enter_room(query, context, db_user, room_fee):
-    lang = lang_of(db_user)
-    game = db.get_or_create_active_game(room_fee)
-
-    if game["state"] == "running":
-        # A game is already in progress for this room - tell the player
-        # to wait for the current round to finish rather than letting
-        # them buy into a game whose calling has already started.
-        await query.answer(get_text("room_busy_alert", lang), show_alert=True)
-        return
-
-    context.user_data[_selection_key(room_fee)] = set()
-    context.user_data["current_room_fee"] = room_fee
-    context.user_data["current_game_id"] = game["id"]
-
-    await show_card_page(query, context, db_user, page=0)
-
-
-async def show_card_page(query, context, db_user, page):
-    lang = lang_of(db_user)
-    room_fee = context.user_data.get("current_room_fee")
-    game_id = context.user_data.get("current_game_id")
-    if room_fee is None or game_id is None:
-        await query.answer(get_text("error_generic", lang), show_alert=True)
-        return
-
-    selected = context.user_data.get(_selection_key(room_fee), set())
-    game = db.get_game(game_id)
-    sold = db.count_cards_sold(game_id)
-
-    header = get_text(
-        "card_select_header", lang,
-        fee=fmt(room_fee), balance=fmt(db_user["balance"]), pool=fmt(game["pool"]),
-        sold=sold, last_buyer=get_last_buyer_label(game_id), countdown="-",
-        max_cards=config.MAX_CARDS_PER_PLAYER,
-    )
-
-    await safe_edit(query, header, reply_markup=build_card_page_keyboard(game_id, room_fee, lang, page, selected))
-    context.user_data["current_page"] = page
-
-
-async def toggle_card_selection(query, context, db_user, idx):
-    lang = lang_of(db_user)
-    room_fee = context.user_data.get("current_room_fee")
-    game_id = context.user_data.get("current_game_id")
-    if room_fee is None or game_id is None:
-        await query.answer(get_text("error_generic", lang), show_alert=True)
-        return
-
-    taken = db.get_taken_cards(game_id)
-    if idx in taken:
-        await query.answer(get_text("card_taken", lang, num=idx + 1), show_alert=True)
-        return
-
-    selected = context.user_data.setdefault(_selection_key(room_fee), set())
-
-    if idx in selected:
-        selected.discard(idx)
-    else:
-        if len(selected) >= config.MAX_CARDS_PER_PLAYER:
-            await query.answer(get_text("max_cards_exceeded", lang, max=config.MAX_CARDS_PER_PLAYER), show_alert=True)
-            return
-        selected.add(idx)
-
-    page = context.user_data.get("current_page", 0)
-    await show_card_page(query, context, db_user, page)
-
-
-async def random_pick(query, context, db_user, count):
-    lang = lang_of(db_user)
-    room_fee = context.user_data.get("current_room_fee")
-    game_id = context.user_data.get("current_game_id")
-    if room_fee is None or game_id is None:
-        await query.answer(get_text("error_generic", lang), show_alert=True)
-        return
-
-    taken = db.get_taken_cards(game_id)
-    selected = context.user_data.setdefault(_selection_key(room_fee), set())
-
-    available = [i for i in range(config.CARD_POOL_SIZE) if i not in taken and i not in selected]
-    import random as _random
-    _random.shuffle(available)
-
-    room_for_more = config.MAX_CARDS_PER_PLAYER - len(selected)
-    to_add = available[:min(count, room_for_more)]
-
-    if not to_add and room_for_more <= 0:
-        await query.answer(get_text("max_cards_exceeded", lang, max=config.MAX_CARDS_PER_PLAYER), show_alert=True)
-        return
-
-    selected.update(to_add)
-    page = context.user_data.get("current_page", 0)
-    await show_card_page(query, context, db_user, page)
-
-
-async def confirm_purchase(query, context, db_user):
-    lang = lang_of(db_user)
-    user_id = db_user["user_id"]
-    room_fee = context.user_data.get("current_room_fee")
-    game_id = context.user_data.get("current_game_id")
-    selected = context.user_data.get(_selection_key(room_fee), set())
-
-    if not selected:
-        await query.answer(get_text("no_cards_selected", lang), show_alert=True)
-        return
-
-    success, reason = db.purchase_cards(game_id, user_id, list(selected), room_fee)
-
-    if not success:
-        if reason == "insufficient_balance":
-            needed = room_fee * len(selected)
-            await query.answer(
-                get_text("insufficient_balance_buy", lang, needed=fmt(needed), have=fmt(db_user["balance"])),
-                show_alert=True,
-            )
-        elif reason == "card_taken":
-            # The DB call fails atomically without telling us which specific
-            # index collided (another player could have grabbed any of our
-            # selected cards a moment ago) - num=0 displays as "#0" which
-            # would be misleading, so use the lowest selected index as a
-            # representative placeholder and rely on the page refresh below
-            # to show the player exactly which cards are now unavailable.
-            first_selected = min(selected) + 1
-            await query.answer(get_text("card_taken", lang, num=first_selected), show_alert=True)
-            # Refresh the page so the now-stale "taken" state is visible
-            page = context.user_data.get("current_page", 0)
-            await show_card_page(query, context, db_user, page)
-        elif reason == "max_cards_exceeded":
-            await query.answer(get_text("max_cards_exceeded", lang, max=config.MAX_CARDS_PER_PLAYER), show_alert=True)
-        else:
-            await query.answer(get_text("error_generic", lang), show_alert=True)
-        return
-
-    context.user_data[_selection_key(room_fee)] = set()
-    new_balance = db.get_balance(user_id)
-    await query.answer("OK")  # lightweight ack; the lobby screen render below shows full detail
-
-    # Register this player's live message for the upcoming game loop -
-    # we reuse the SAME message (the one with the card grid) by editing
-    # it into the "waiting for game to start" lobby screen.
-    db.upsert_game_player_message(game_id, user_id, query.message.chat_id, query.message.message_id)
-
-    await render_lobby_screen(context.bot, game_id, user_id, lang)
-
-    # Ensure a lifecycle task is running for this room now that someone
-    # has bought in (guarded so only ONE task per room can ever exist).
-    await ensure_game_lifecycle_started(context, room_fee, game_id)
-
-
-# =====================================================================
-# GAME LIFECYCLE ENGINE
-# One asyncio task per room drives: countdown -> (refund OR run game)
-# -> resolve winners -> reset room for the next round.
-# =====================================================================
-
-def get_last_buyer_label(game_id) -> str:
-    cards = db.get_all_game_cards(game_id)
-    if not cards:
-        return "-"
-    last = max(cards, key=lambda c: c["created_at"])
-    owner = db.get_user(last["owner_id"])
-    name = owner["username"] if owner else str(last["owner_id"])
-    return bingo.mask_username(name, config.MASK_VISIBLE_CHARS)
-
-
-async def render_lobby_screen(bot, game_id, user_id, lang, countdown_remaining=None):
-    """Render the 'waiting for game to start' screen into ONE player's
-    message. Called in a loop over every seated player by the
-    countdown ticker so all of them see a synchronized live countdown."""
-    game = db.get_game(game_id)
-    sold = db.count_cards_sold(game_id)
-    gp = db.get_game_player(game_id, user_id)
-    if gp is None or gp["chat_id"] is None:
-        return
-
-    countdown_text = str(countdown_remaining) if countdown_remaining is not None else str(config.COUNTDOWN_SECONDS)
-
-    text = get_text(
-        "lobby_waiting", lang,
-        pool=fmt(game["pool"]), sold=sold, countdown=countdown_text,
-        min_cards=config.MIN_CARDS_TO_START,
-    )
-    await safe_edit_by_id(bot, gp["chat_id"], gp["message_id"], text)
-
-
-async def broadcast_lobby_tick(bot, game_id, seconds_remaining):
-    """Push the current countdown to every seated player's message."""
-    players = db.get_game_players(game_id)
-    for p in players:
-        user = db.get_user(p["user_id"])
-        lang = lang_of(user) if user else config.DEFAULT_LANGUAGE
-        await render_lobby_screen(bot, game_id, p["user_id"], lang, countdown_remaining=seconds_remaining)
-
-
-async def ensure_game_lifecycle_started(context, room_fee, game_id):
-    """Spawn the countdown/game asyncio task for this room IF one isn't
-    already running. Guarded by a per-room lock so two near-simultaneous
-    purchases can't both spawn duplicate tasks."""
-    lock = ROOM_LOCKS[room_fee]
-    async with lock:
-        existing_task = ACTIVE_GAME_TASKS.get(room_fee)
-        if existing_task is not None and not existing_task.done():
-            return  # already running, nothing to do
-
-        sold = db.count_cards_sold(game_id)
-        if sold < 1:
-            return  # nothing to start yet
-
-        task = asyncio.create_task(run_game_lifecycle(context, room_fee, game_id))
-        ACTIVE_GAME_TASKS[room_fee] = task
-
-
-async def run_game_lifecycle(context, room_fee, game_id):
-    """The full lifecycle for one room's round:
-      1. Countdown for config.COUNTDOWN_SECONDS, ticking every player's
-         lobby screen each second.
-      2. At countdown end: if fewer than MIN_CARDS_TO_START cards sold,
-         refund everyone and reset the room (new 'waiting' game created
-         on next purchase - we don't pre-create it here to avoid an
-         empty game row sitting around indefinitely).
-      3. Otherwise: mark game 'running', then call numbers one at a
-         time (config.CALL_DELAY_SECONDS apart), pushing the live
-         board to every player after each call, auto-claiming for any
-         player with AUTO ON the instant they have a valid win.
-      4. On win (manual BINGO claim OR auto-claim) OR exhausting all 75
-         calls with no winner: resolve the round (split pot among any
-         simultaneous winners, or refund everyone if no winner) and
-         finish the game.
-      5. A fresh 'waiting' game is created for the room so the next
-         purchase has somewhere to land.
-    """
-    bot = context.bot
-    try:
-        # ---- PHASE A: COUNTDOWN ----
-        for remaining in range(config.COUNTDOWN_SECONDS, 0, -1):
-            await asyncio.sleep(1)
-            sold = db.count_cards_sold(game_id)
-            # Only bother ticking the UI every player sees if anyone's
-            # actually seated - cheap early-exit guard.
-            if sold > 0:
-                await broadcast_lobby_tick(bot, game_id, remaining)
-
-        sold = db.count_cards_sold(game_id)
-        if sold < config.MIN_CARDS_TO_START:
-            await handle_insufficient_players_refund(bot, game_id)
-            return
-
-        # ---- PHASE B: RUN THE GAME ----
-        db.set_game_state(game_id, "running")
-        await broadcast_game_starting(bot, game_id)
-
-        call_sequence = bingo.generate_call_sequence()
-        called_numbers = []
-        winners_found = {}  # user_id -> {card_index: win_type}
-        GAME_MANUAL_CLAIMS[game_id] = {}
-
-        for call_index, number in enumerate(call_sequence[: config.MAX_NUMBERS_CALLED], start=1):
-            called_numbers.append(number)
-            db.add_called_number(game_id, call_index, number)
-
-            auto_winners = await push_call_and_check_wins(bot, game_id, called_numbers, call_index)
-
-            # Merge in anything a player claimed manually via the BINGO
-            # button since the last call - re-validate against the
-            # CURRENT called_numbers in case the claim was stale (e.g.
-            # pressed right as a new number was being called).
-            manual_claims = GAME_MANUAL_CLAIMS.get(game_id, {})
-            for claim_user_id, claimed_cards in list(manual_claims.items()):
-                revalidated = bingo.evaluate_player_cards_detailed(claimed_cards, called_numbers)
-                if revalidated:
-                    auto_winners.setdefault(claim_user_id, {}).update(revalidated)
-
-            winners_found = auto_winners
-            if winners_found:
-                break
-
-        # ---- PHASE C: RESOLVE ----
-        if winners_found:
-            await resolve_round_winners(bot, game_id, room_fee, winners_found)
-        else:
-            await resolve_round_no_winner(bot, game_id, room_fee, called_numbers)
-
-    except Exception:
-        logger.exception(f"Game lifecycle crashed for room {room_fee}, game {game_id}")
-        # Best-effort safety net: refund everyone rather than leave money
-        # in limbo if something unexpected blew up mid-round.
-        try:
-            db.refund_game(game_id)
-            db.set_game_state(game_id, "finished")
-        except Exception:
-            logger.exception("Refund-on-crash ALSO failed - manual DB check needed")
-    finally:
-        # Always leave a fresh waiting game for this room so the next
-        # purchase has somewhere to land, and clear the task slot.
-        db.get_or_create_active_game(room_fee)
-        ACTIVE_GAME_TASKS.pop(room_fee, None)
-        GAME_MANUAL_CLAIMS.pop(game_id, None)
-
-
-async def handle_insufficient_players_refund(bot, game_id):
-    refunded = db.refund_game(game_id)
-    db.set_game_state(game_id, "finished")
-
-    for user_id, amount in refunded.items():
-        user = db.get_user(user_id)
-        lang = lang_of(user) if user else config.DEFAULT_LANGUAGE
-        gp = db.get_game_player(game_id, user_id)
-        text = get_text("lobby_refund", lang, amount=fmt(amount))
-        if gp and gp["chat_id"]:
-            await safe_edit_by_id(bot, gp["chat_id"], gp["message_id"], text, reply_markup=back_keyboard(lang))
-
-
-async def broadcast_game_starting(bot, game_id):
-    players = db.get_game_players(game_id)
-    for p in players:
-        user = db.get_user(p["user_id"])
-        lang = lang_of(user) if user else config.DEFAULT_LANGUAGE
-        if p["chat_id"]:
-            try:
-                await bot.send_message(chat_id=p["chat_id"], text=get_text("game_starting", lang), parse_mode="HTML")
-            except Forbidden:
-                pass
-
-
-async def push_call_and_check_wins(bot, game_id, called_numbers, call_index):
-    """Push the latest called number + updated board to every seated
-    player, and for anyone with AUTO ON, check their cards immediately
-    and treat a detected win as an instant claim.
-
-    Returns a dict: {user_id: {card_index: win_type}} containing ONLY
-    the winners detected on THIS call (empty dict if none) - this is
-    what the outer loop uses to decide whether to stop calling.
-
-    Manual BINGO claims (button presses) are handled separately in
-    game_bingo_claim() and write into a shared 'pending_manual_claims'
-    structure in bot_data so they get folded into the same resolution
-    step if they land within this call's processing.
-    """
-    players = db.get_game_players(game_id)
-    game = db.get_game(game_id)
-    auto_winners = {}
-
-    number = called_numbers[-1]
-    announcement = bingo.format_call_announcement(number)
-
-    for p in players:
-        user_id = p["user_id"]
-        user = db.get_user(user_id)
-        lang = lang_of(user) if user else config.DEFAULT_LANGUAGE
-        if not p["chat_id"]:
-            continue
-
-        card_indices = db.get_player_cards(game_id, user_id)
-        header = get_text(
-            "game_header", lang, fee=fmt(game["room_fee"]),
-            called=call_index, total=config.MAX_NUMBERS_CALLED, pool=fmt(game["pool"]), players=len(players),
-        )
-        number_line = get_text("number_called", lang, letter=bingo.number_to_letter(number), number=number, amharic=bingo.number_to_amharic(number))
-
-        grid = bingo.render_number_grid_html(called_numbers)
-        cards_html = "\n\n".join(
-            bingo.render_card_html_with_label(idx, bingo.get_card(idx), called_numbers)
-            for idx in card_indices
-        )
-
-        full_text = f"{header}{number_line}\n\n{grid}\n\n{cards_html}"
-
-        await safe_edit_by_id(
-            bot, p["chat_id"], p["message_id"], full_text,
-            reply_markup=active_game_keyboard(lang, auto_win_on=bool(p["auto_win"]), marked_count=len(called_numbers), total_called=len(called_numbers)),
-        )
-
-        if p["auto_win"]:
-            detected = bingo.evaluate_player_cards_detailed(card_indices, called_numbers)
-            if detected:
-                auto_winners[user_id] = detected
-
-    return auto_winners
-
-
-async def resolve_round_winners(bot, game_id, room_fee, winners_found):
-    """winners_found: {user_id: {card_index: win_type}}.
-    Pays out: house takes its commission, the remainder is split EQUALLY
-    among every winning user_id (one share per USER, not per winning
-    card, per product decision - corners and line pay identically and
-    a simultaneous claim of either type splits the pot the same way)."""
-    game = db.get_game(game_id)
-    pool = game["pool"]
-    house_cut = round(pool * config.HOUSE_COMMISSION_PERCENT / 100, 2)
-    remaining = round(pool - house_cut, 2)
-
-    winner_ids = list(winners_found.keys())
-    per_winner_amount = round(remaining / len(winner_ids), 2)
-
-    db.finish_game(game_id, winner_ids, house_cut, per_winner_amount)
-    db.credit_house(house_cut)
-
-    for user_id in winner_ids:
-        new_balance = db.adjust_balance(user_id, per_winner_amount)
-        db.record_transaction(user_id, "bingo_win", per_winner_amount, status="completed")
-
-    winner_label_list = []
-    for user_id in winner_ids:
-        user = db.get_user(user_id)
-        name = user["username"] if user else str(user_id)
-        winner_label_list.append(bingo.mask_username(name, config.MASK_VISIBLE_CHARS))
-    winner_list_str = ", ".join(winner_label_list)
-
-    players = db.get_game_players(game_id)
-    for p in players:
-        user_id = p["user_id"]
-        user = db.get_user(user_id)
-        lang = lang_of(user) if user else config.DEFAULT_LANGUAGE
-        if not p["chat_id"]:
-            continue
-
-        if user_id in winners_found:
-            card_indices_won = list(winners_found[user_id].keys())
-            card_num_display = card_indices_won[0] + 1
-            new_balance = db.get_balance(user_id)
-
-            if len(winner_ids) == 1:
-                win_type = list(winners_found[user_id].values())[0]
-                key = "win_corners" if win_type == "corners" else "win_line"
-                text = get_text(key, lang, username=bingo.mask_username(user["username"] if user else "", config.MASK_VISIBLE_CHARS),
-                                 amount=fmt(per_winner_amount), card_num=card_num_display, balance=fmt(new_balance))
-            else:
-                text = get_text("win_split", lang, winner_count=len(winner_ids), amount=fmt(per_winner_amount),
-                                 card_num=card_num_display, balance=fmt(new_balance))
-        else:
-            if len(winner_ids) == 1:
-                win_user_id = winner_ids[0]
-                win_user = db.get_user(win_user_id)
-                win_name = bingo.mask_username(win_user["username"] if win_user else "", config.MASK_VISIBLE_CHARS)
-                win_type = list(winners_found[win_user_id].values())[0]
-                win_type_label = get_text("win_type_corners", lang) if win_type == "corners" else get_text("win_type_line", lang)
-                card_num_display = list(winners_found[win_user_id].keys())[0] + 1
-                text = get_text("win_announce_others", lang, username=win_name, amount=fmt(per_winner_amount),
-                                 card_num=card_num_display, win_type=win_type_label)
-            else:
-                text = get_text("win_split_announce_others", lang, winner_count=len(winner_ids),
-                                 amount=fmt(per_winner_amount), winner_list=winner_list_str)
-
-        await safe_edit_by_id(bot, p["chat_id"], p["message_id"], text, reply_markup=play_again_keyboard(lang, room_fee))
-
-
-async def resolve_round_no_winner(bot, game_id, room_fee, called_numbers):
-    """All 75 numbers called, nobody won - full refund to everyone."""
-    refunded = db.refund_game(game_id)
-    db.finish_game(game_id, [], 0, 0)
-
-    for user_id, amount in refunded.items():
-        user = db.get_user(user_id)
-        lang = lang_of(user) if user else config.DEFAULT_LANGUAGE
-        gp = db.get_game_player(game_id, user_id)
-        if gp and gp["chat_id"]:
-            text = get_text("no_winner_refund", lang, amount=fmt(amount))
-            await safe_edit_by_id(bot, gp["chat_id"], gp["message_id"], text, reply_markup=play_again_keyboard(lang, room_fee))
-
-
-# =====================================================================
-# IN-GAME BUTTON HANDLERS (Check All / Auto toggle / BINGO claim)
-# =====================================================================
-
-def _find_user_active_game(user_id):
-    """A player only has ONE game they can be actively seated in across
-    all rooms at a time (cards are purchased per-room, and rooms run
-    independently, but in practice a player waits for one round before
-    joining another). Find the game_id + room_fee for whichever room
-    this user currently has a game_players row with state running/waiting."""
-    for fee in config.ROOM_FEES:
-        game = db.get_or_create_active_game(fee)
-        gp = db.get_game_player(game["id"], user_id)
-        if gp is not None:
-            return game["id"], fee
-    return None, None
-
-
-async def game_check_all(query, context, db_user):
-    """Manually re-render the player's own cards/board on demand -
-    mostly useful as a 'refresh' if their message somehow got out of
-    sync, since the loop already auto-pushes after every call."""
-    lang = lang_of(db_user)
-    user_id = db_user["user_id"]
-    game_id, room_fee = _find_user_active_game(user_id)
-    if game_id is None:
-        await query.answer(get_text("error_generic", lang), show_alert=True)
-        return
-
-    called_numbers = db.get_called_numbers(game_id)
-    card_indices = db.get_player_cards(game_id, user_id)
-    game = db.get_game(game_id)
-    players = db.get_game_players(game_id)
-    gp = db.get_game_player(game_id, user_id)
-
-    header = get_text(
-        "game_header", lang, fee=fmt(room_fee),
-        called=len(called_numbers), total=config.MAX_NUMBERS_CALLED,
-        pool=fmt(game["pool"]), players=len(players),
-    )
-    grid = bingo.render_number_grid_html(called_numbers)
-    cards_html = "\n\n".join(
-        bingo.render_card_html_with_label(idx, bingo.get_card(idx), called_numbers)
-        for idx in card_indices
-    )
-    text = f"{header}{grid}\n\n{cards_html}"
-
-    await safe_edit(query, text, reply_markup=active_game_keyboard(lang, auto_win_on=bool(gp["auto_win"]), marked_count=len(called_numbers), total_called=len(called_numbers)))
-
-
-async def game_toggle_auto(query, context, db_user):
-    lang = lang_of(db_user)
-    user_id = db_user["user_id"]
-    game_id, room_fee = _find_user_active_game(user_id)
-    if game_id is None:
-        await query.answer(get_text("error_generic", lang), show_alert=True)
-        return
-
-    gp = db.get_game_player(game_id, user_id)
-    new_value = not bool(gp["auto_win"])
-    db.set_auto_win(game_id, user_id, new_value)
-
-    await query.answer(get_text("auto_win_on", lang) if new_value else get_text("auto_win_off", lang))
-    await game_check_all(query, context, db_user)
-
-
-async def game_bingo_claim(query, context, db_user):
-    """Manual BINGO button press. Validates the claim against the
-    numbers called SO FAR (read from DB, always authoritative) and, if
-    valid, registers it into GAME_MANUAL_CLAIMS so the calling loop
-    picks it up and resolves the round. If invalid, tells the player
-    without disrupting the game for anyone else."""
-    lang = lang_of(db_user)
-    user_id = db_user["user_id"]
-    game_id, room_fee = _find_user_active_game(user_id)
-    if game_id is None:
-        await query.answer(get_text("error_generic", lang), show_alert=True)
-        return
-
-    game = db.get_game(game_id)
-    if game["state"] != "running":
-        await query.answer(get_text("game_not_running", lang), show_alert=True)
-        return
-
-    called_numbers = db.get_called_numbers(game_id)
-    card_indices = db.get_player_cards(game_id, user_id)
-    detected = bingo.evaluate_player_cards_detailed(card_indices, called_numbers)
-
-    if not detected:
-        await query.answer(get_text("bingo_claim_invalid", lang), show_alert=True)
-        return
-
-    GAME_MANUAL_CLAIMS.setdefault(game_id, {})[user_id] = card_indices
-    await query.answer(get_text("bingo_claim_accepted", lang), show_alert=True)
-
-
-# =====================================================================
-# DEPOSIT FLOW (pick amount -> show account -> paste SMS -> verify)
-# =====================================================================
-
-async def menu_deposit_entry(query, context, db_user):
-    lang = lang_of(db_user)
-    await safe_edit(query, get_text("deposit_pick_amount", lang), reply_markup=deposit_amount_keyboard(lang))
-
-
-async def deposit_amount_chosen(query, context, db_user, data):
-    lang = lang_of(db_user)
-
-    if data == "depamt_custom":
-        await safe_edit(query, get_text("deposit_custom_prompt", lang, min=fmt(config.MIN_DEPOSIT)))
-        context.user_data["awaiting_custom_deposit"] = True
-        return DEPOSIT_CUSTOM_AMOUNT
-
-    amount = float(data.split("_", 1)[1])
-    await show_deposit_account(query, context, db_user, amount)
-    return ConversationHandler.END
-
-
-async def custom_deposit_amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    db_user = db.get_user(user.id)
-    lang = lang_of(db_user)
-    amount = safe_amount(update.message.text)
-
-    if amount is None or amount < config.MIN_DEPOSIT:
-        await update.message.reply_text(get_text("deposit_amount_too_low", lang, min=fmt(config.MIN_DEPOSIT)))
-        return DEPOSIT_CUSTOM_AMOUNT
-
-    context.user_data["pending_deposit_amount"] = amount
-    context.user_data.pop("awaiting_custom_deposit", None)
-
-    account = db.get_active_deposit_account()
-    if account is None:
-        await update.message.reply_text(get_text("deposit_no_account", lang))
-        return ConversationHandler.END
-
-    text = get_text(
-        "deposit_instructions", lang, amount=fmt(amount),
-        telebirr_number=account["phone"], recipient_name=account["recipient_name"],
-    )
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=back_keyboard(lang))
-    return ConversationHandler.END
-
-
-async def show_deposit_account(query, context, db_user, amount):
-    lang = lang_of(db_user)
-    context.user_data["pending_deposit_amount"] = amount
-
-    account = db.get_active_deposit_account()
-    if account is None:
-        await safe_edit(query, get_text("deposit_no_account", lang), reply_markup=back_keyboard(lang))
-        return
-
-    text = get_text(
-        "deposit_instructions", lang, amount=fmt(amount),
-        telebirr_number=account["phone"], recipient_name=account["recipient_name"],
-    )
-    await safe_edit(query, text, reply_markup=back_keyboard(lang))
-
-
-async def handle_possible_sms(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Catches any free-text message that isn't part of an active
-    conversation - checks if it looks like a pasted Telebirr SMS."""
-    text = update.message.text
-    user = update.effective_user
-    db_user = db.get_user(user.id)
-    if db_user is None:
-        return
-    lang = lang_of(db_user)
-
-    if "ETB" not in text.upper():
-        return  # not an SMS-looking message; silently ignore rather than
-                 # spam unrelated chatter with an error
-
-    account = db.get_active_deposit_account()
-    if account is None:
-        await update.message.reply_text(get_text("deposit_no_account", lang))
-        return
-
-    parsed = parse_telebirr_sms(text)
-    if parsed is None:
-        await update.message.reply_text(get_text("deposit_invalid", lang))
-        return
-
-    expected_last4 = account["phone"][-4:]
-    ok, reason = verify_recipient(parsed, account["recipient_name"], expected_last4)
-    if not ok:
-        await update.message.reply_text(
-            get_text("deposit_wrong_account", lang, telebirr_number=account["phone"], recipient_name=account["recipient_name"])
-        )
-        return
-
-    if db.reference_already_used(parsed["reference"]):
-        await update.message.reply_text(get_text("deposit_already_used", lang))
-        return
-
-    pending_amount = context.user_data.get("pending_deposit_amount")
-    if pending_amount is not None:
-        amount_ok, amount_reason = validate_deposit_amount(parsed, expected_amount=pending_amount)
-        if not amount_ok:
-            await update.message.reply_text(
-                get_text("deposit_amount_mismatch", lang, expected_amount=fmt(pending_amount), sms_amount=fmt(parsed["amount"]))
-            )
-            return
-
-    new_balance = db.adjust_balance(user.id, parsed["amount"])
-    db.record_transaction(user.id, "deposit", parsed["amount"], reference=parsed["reference"], status="completed")
-    db.record_deposit_for_account(account["id"])
-    context.user_data.pop("pending_deposit_amount", None)
-
+async def handle_contact(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    contact = update.message.contact
+    tg = update.effective_user
+    if contact.user_id != tg.id:
+        user = await db.get_user(tg.id)
+        await update.message.reply_text(t("invalid_phone", user or {"language": "en"}))
+        return PHONE_INPUT
+
+    phone = contact.phone_number.replace("+251", "0").replace("+", "")
+    if not phone.startswith("09") or len(phone) != 10:
+        phone = "0" + phone[-9:]
+    user = await db.get_user(tg.id) or {}
+    await db.set_phone(tg.id, phone)
+    user = await db.get_user(tg.id)
     await update.message.reply_text(
-        get_text("deposit_success", lang, amount=fmt(parsed["amount"]), balance=fmt(new_balance)),
-        parse_mode="HTML", reply_markup=main_menu_keyboard(lang),
+        t("phone_saved", user),
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await update.message.reply_text(
+        t("main_menu", user, balance=round(user["balance"], 2)),
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_markup(user),
+    )
+    return ConversationHandler.END
+
+
+async def handle_plain_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.message.text or "").strip()
+    tg = update.effective_user
+    user = await db.get_user(tg.id) or {"language": "en"}
+
+    # Validate Ethiopian phone
+    digits = text.replace("-", "").replace(" ", "")
+    if not (digits.startswith("09") and len(digits) == 10 and digits.isdigit()):
+        await update.message.reply_text(t("invalid_phone", user))
+        return PHONE_INPUT
+
+    await db.set_phone(tg.id, digits)
+    user = await db.get_user(tg.id)
+    await update.message.reply_text(t("phone_saved", user), reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text(
+        t("main_menu", user, balance=round(user["balance"], 2)),
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_markup(user),
+    )
+    return ConversationHandler.END
+
+
+# ── Callback router ────────────────────────────────────────────────────────────
+
+async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+    tg = update.effective_user
+    user = await db.get_user(tg.id)
+    if not user:
+        return
+
+    if data == "noop":
+        return
+    elif data == "main_menu":
+        user = await db.get_user(tg.id)
+        await q.edit_message_text(
+            t("main_menu", user, balance=round(user["balance"], 2)),
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu_markup(user),
+        )
+    elif data == "games":
+        await q.edit_message_text(
+            t("games_menu", user),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🎯 Bingo", callback_data="rooms")],
+                [InlineKeyboardButton("🔒 Slot (Coming Soon)", callback_data="noop")],
+                [InlineKeyboardButton(get_text("btn_back", lang(user)), callback_data="main_menu")],
+            ]),
+        )
+    elif data == "rooms":
+        await q.edit_message_text(
+            t("room_menu", user),
+            parse_mode=ParseMode.HTML,
+            reply_markup=rooms_markup(user),
+        )
+    elif data.startswith("room:"):
+        room_fee = int(data.split(":")[1])
+        await _show_card_selection(q, tg.id, user, room_fee, page=0, ctx=ctx)
+    elif data.startswith("card_page:"):
+        _, room_fee_s, page_s = data.split(":")
+        room_fee, page = int(room_fee_s), int(page_s)
+        await _refresh_card_selection(q, tg.id, user, room_fee, page)
+    elif data.startswith("card_toggle:"):
+        _, room_fee_s, card_num_s, page_s = data.split(":")
+        room_fee, card_num, page = int(room_fee_s), int(card_num_s), int(page_s)
+        await _toggle_card(q, tg.id, user, room_fee, card_num, page)
+    elif data.startswith("rand_card:"):
+        parts = data.split(":")
+        room_fee, page, n = int(parts[1]), int(parts[2]), int(parts[3])
+        await _pick_random_cards(q, tg.id, user, room_fee, page, n)
+    elif data.startswith("buy_cards:"):
+        room_fee = int(data.split(":")[1])
+        await _buy_cards(q, tg.id, user, room_fee, ctx.application)
+    elif data.startswith("auto_win:"):
+        room_fee = int(data.split(":")[1])
+        _toggle_auto_win(tg.id, room_fee)
+        g = GAMES.get(room_fee)
+        if g:
+            text = game_screen_text(room_fee, user)
+            markup = game_screen_markup(room_fee, tg.id, user)
+            await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    elif data.startswith("check_win:"):
+        room_fee = int(data.split(":")[1])
+        await _handle_check(q, tg.id, user, room_fee)
+    elif data.startswith("claim_bingo:"):
+        room_fee = int(data.split(":")[1])
+        await _handle_bingo_claim(q, tg.id, user, room_fee, ctx.application)
+    elif data == "balance":
+        user = await db.get_user(tg.id)
+        await q.edit_message_text(
+            t("balance_msg", user, balance=round(user["balance"], 2)),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(get_text("btn_back", lang(user)), callback_data="main_menu")
+            ]]),
+        )
+    elif data == "profile":
+        await _show_profile(q, tg.id, user)
+    elif data == "transactions":
+        await _show_transactions(q, tg.id, user)
+    elif data == "referral":
+        await _show_referral(q, tg.id, user)
+    elif data == "toggle_lang":
+        new_lang = "am" if lang(user) == "en" else "en"
+        await db.set_language(tg.id, new_lang)
+        user = await db.get_user(tg.id)
+        await q.edit_message_text(
+            t("main_menu", user, balance=round(user["balance"], 2)),
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu_markup(user),
+        )
+
+
+# ── Card selection sub-handlers ───────────────────────────────────────────────
+
+async def _show_card_selection(q, user_tid: int, user: dict, room_fee: int, page: int, ctx) -> None:
+    await ensure_game_for_room(ctx.application, room_fee)
+    g = GAMES[room_fee]
+    if g["status"] == "running":
+        # Game already in progress — show game screen
+        if user_tid in g["participants"]:
+            text = game_screen_text(room_fee, user)
+            markup = game_screen_markup(room_fee, user_tid, user)
+            msg = await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            g["game_messages"][user_tid] = msg.message_id
+        else:
+            await q.answer("Game already running. Wait for next round.", show_alert=True)
+        return
+
+    text = card_selection_text(room_fee, user_tid, user)
+    markup = card_selection_markup(room_fee, page, user_tid, user)
+    await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+
+async def _refresh_card_selection(q, user_tid: int, user: dict, room_fee: int, page: int) -> None:
+    text = card_selection_text(room_fee, user_tid, user)
+    markup = card_selection_markup(room_fee, page, user_tid, user)
+    try:
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    except BadRequest:
+        pass
+
+
+async def _toggle_card(q, user_tid: int, user: dict, room_fee: int, card_num: int, page: int) -> None:
+    g = GAMES[room_fee]
+    if g["status"] == "running":
+        await q.answer("Game started! No more purchases.", show_alert=True)
+        return
+
+    my_cards = g["user_cards"].setdefault(user_tid, [])
+    owner = g["card_owners"].get(card_num)
+
+    if owner is not None and owner != user_tid:
+        await q.answer("Card already taken!", show_alert=True)
+        return
+
+    if card_num in my_cards:
+        # Deselect
+        my_cards.remove(card_num)
+    else:
+        # Select
+        if len(my_cards) >= config.MAX_CARDS_PER_PLAYER:
+            await q.answer(f"Max {config.MAX_CARDS_PER_PLAYER} cards per game!", show_alert=True)
+            return
+        my_cards.append(card_num)
+        g["card_owners"][card_num] = user_tid
+
+    # Remove ownership if deselected
+    if card_num not in my_cards and g["card_owners"].get(card_num) == user_tid:
+        del g["card_owners"][card_num]
+
+    await _refresh_card_selection(q, user_tid, user, room_fee, page)
+
+
+async def _pick_random_cards(q, user_tid: int, user: dict, room_fee: int, page: int, n: int) -> None:
+    g = GAMES[room_fee]
+    my_cards = g["user_cards"].setdefault(user_tid, [])
+    can_pick = config.MAX_CARDS_PER_PLAYER - len(my_cards)
+    if can_pick <= 0:
+        await q.answer(f"Max {config.MAX_CARDS_PER_PLAYER} cards reached!", show_alert=True)
+        return
+    n = min(n, can_pick)
+    available = [i for i in range(1, config.TOTAL_CARDS + 1) if i not in g["card_owners"]]
+    picks = random.sample(available, min(n, len(available)))
+    for card_num in picks:
+        my_cards.append(card_num)
+        g["card_owners"][card_num] = user_tid
+    await _refresh_card_selection(q, user_tid, user, room_fee, page)
+
+
+async def _buy_cards(q, user_tid: int, user: dict, room_fee: int, app: Application) -> None:
+    g = GAMES[room_fee]
+    if g["status"] == "running":
+        await q.answer("Game already started!", show_alert=True)
+        return
+
+    my_card_nums = g["user_cards"].get(user_tid, [])
+    if not my_card_nums:
+        await q.answer(get_text("no_cards_selected", lang(user)), show_alert=True)
+        return
+
+    total_cost = len(my_card_nums) * room_fee
+    if user["balance"] < total_cost - 0.001:
+        await q.answer(
+            get_text("insufficient_balance", lang(user),
+                     need=total_cost, have=round(user["balance"], 2)),
+            show_alert=True
+        )
+        return
+
+    game_id = await ensure_game_for_room(app, room_fee)
+
+    # Atomic purchase — deduct balance then write cards
+    ok, new_bal = await db.deduct_balance(user_tid, total_cost, "card_buy",
+                                          f"room:{room_fee} cards:{my_card_nums}")
+    if not ok:
+        await q.answer(
+            get_text("insufficient_balance", lang(user),
+                     need=total_cost, have=round(user["balance"], 2)),
+            show_alert=True
+        )
+        return
+
+    failed_cards = []
+    for card_num in list(my_card_nums):
+        grid = g["all_card_grids"].get(card_num)
+        success = await db.add_game_card(game_id, user_tid, card_num, grid)
+        if not success:
+            # Someone else grabbed it — remove from selection
+            my_card_nums.remove(card_num)
+            if g["card_owners"].get(card_num) == user_tid:
+                del g["card_owners"][card_num]
+            failed_cards.append(card_num)
+
+    # Refund for failed cards
+    if failed_cards:
+        refund = len(failed_cards) * room_fee
+        await db.add_balance(user_tid, refund, "refund", note="card_taken")
+
+    g["participants"].add(user_tid)
+    g["prize_pool"] = len(g["card_owners"]) * room_fee
+    await db.update_game_pool(game_id, g["prize_pool"])
+    g["last_buyer_name"] = mask_name(user.get("first_name", ""), user.get("username", ""))
+
+    user = await db.get_user(user_tid)
+
+    # Start countdown if threshold met
+    sold = len(g["card_owners"])
+    if sold >= config.MIN_CARDS_TO_START and g["status"] == "lobby":
+        await start_countdown(app, room_fee)
+
+    # Show waiting screen
+    status_text = t("countdown_started", user, sec=g["countdown_remaining"], sold=sold) \
+        if g["status"] == "countdown" \
+        else t("waiting_start", user, sold=sold)
+    msg = await q.edit_message_text(status_text, parse_mode=ParseMode.HTML)
+    g["game_messages"][user_tid] = msg.message_id
+
+
+# ── Win claim handlers ─────────────────────────────────────────────────────────
+
+def _toggle_auto_win(user_tid: int, room_fee: int) -> None:
+    g = GAMES.get(room_fee)
+    if not g:
+        return
+    if user_tid in g["auto_win_users"]:
+        g["auto_win_users"].discard(user_tid)
+    else:
+        g["auto_win_users"].add(user_tid)
+
+
+async def _handle_check(q, user_tid: int, user: dict, room_fee: int) -> None:
+    g = GAMES.get(room_fee)
+    if not g or g["status"] != "running":
+        await q.answer(get_text("not_in_game", lang(user)), show_alert=True)
+        return
+    called_set = set(g["called_numbers"])
+    my_cards = g["user_cards"].get(user_tid, [])
+    wins = []
+    for card_num in my_cards:
+        grid = g["all_card_grids"].get(card_num)
+        if grid:
+            won, wt = check_win(grid, called_set)
+            if won:
+                wins.append((card_num, wt))
+    if wins:
+        card_txt = "\n".join(
+            render_card_text(g["all_card_grids"][cn], called_set, cn)
+            for (cn, _) in wins
+        )
+        await q.answer(f"You have a winning card! Tap BINGO! 🎉", show_alert=True)
+    else:
+        await q.answer("No winning pattern yet. Keep playing!", show_alert=False)
+
+
+async def _handle_bingo_claim(q, user_tid: int, user: dict, room_fee: int, app: Application) -> None:
+    g = GAMES.get(room_fee)
+    if not g or g["status"] != "running":
+        await q.answer(get_text("not_in_game", lang(user)), show_alert=True)
+        return
+    called_set = set(g["called_numbers"])
+    my_cards = g["user_cards"].get(user_tid, [])
+    winners = []
+    for card_num in my_cards:
+        grid = g["all_card_grids"].get(card_num)
+        if grid:
+            won, wt = check_win(grid, called_set)
+            if won:
+                winners.append((user_tid, card_num, wt))
+    if winners:
+        await _finish_game(app, room_fee, winners)
+    else:
+        await q.answer(get_text("false_bingo", lang(user)), show_alert=True)
+
+
+# ── Profile / Transactions / Referral ─────────────────────────────────────────
+
+async def _show_profile(q, user_tid: int, user: dict) -> None:
+    ref_count = await db.get_user_referral_count(user_tid)
+    text = t("profile", user,
+             tid=user_tid,
+             username=user.get("username") or "—",
+             phone=user.get("phone") or "—",
+             balance=round(user["balance"], 2),
+             games=user.get("games_played", 0),
+             won=round(user.get("total_won", 0), 2),
+             ref_code=user.get("referral_code", "—"),
+             ref_count=ref_count)
+    await q.edit_message_text(
+        text, parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton(get_text("btn_back", lang(user)), callback_data="main_menu")
+        ]]),
     )
 
-    # Referral bonus: only on this user's FIRST completed deposit
-    db_user = db.get_user(user.id)
-    if (
-        db_user["referred_by"] is not None
-        and db_user["referral_bonus_given"] == 0
-        and db.count_deposits(user.id) == 1
-    ):
-        referrer_id = db_user["referred_by"]
-        referrer_balance = db.adjust_balance(referrer_id, config.REFERRAL_BONUS)
-        db.record_transaction(referrer_id, "referral_bonus", config.REFERRAL_BONUS, status="completed")
-        db.mark_referral_bonus_given(user.id)
 
-        referrer = db.get_user(referrer_id)
-        ref_lang = lang_of(referrer) if referrer else config.DEFAULT_LANGUAGE
-        try:
-            await context.bot.send_message(
-                chat_id=referrer_id,
-                text=get_text(
-                    "referral_bonus_earned", ref_lang,
-                    username=html.escape(db_user["username"] or str(user.id)),
-                    amount=fmt(config.REFERRAL_BONUS), balance=fmt(referrer_balance),
-                ),
-                parse_mode="HTML",
-            )
-        except Forbidden:
-            pass
+async def _show_transactions(q, user_tid: int, user: dict) -> None:
+    txs = await db.get_user_transactions(user_tid, 10)
+    L = lang(user)
+    emoji_map = {
+        "deposit": "📥", "withdraw": "📤", "transfer_out": "➡️",
+        "transfer_in": "⬅️", "card_buy": "🎯", "win": "🏆",
+        "refund": "🔄", "referral": "🎁",
+    }
+    lines = [get_text("transactions_header", L)]
+    for tx in txs:
+        emoji = emoji_map.get(tx["type"], "💰")
+        date_str = datetime.fromtimestamp(tx["created_at"]).strftime("%m/%d %H:%M")
+        lines.append(get_text("tx_row", L,
+                               emoji=emoji, type=tx["type"],
+                               amount=abs(round(tx["amount"], 2)), date=date_str))
+    if len(lines) == 1:
+        lines.append(get_text("no_transactions", L))
+    await q.edit_message_text(
+        "\n".join(lines), parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton(get_text("btn_back", L), callback_data="main_menu")
+        ]]),
+    )
 
 
-# =====================================================================
-# WITHDRAWAL FLOW (conversation, entry point = "menu_withdraw" button)
-# =====================================================================
+async def _show_referral(q, user_tid: int, user: dict) -> None:
+    ref_count = await db.get_user_referral_count(user_tid)
+    text = t("referral_info", user,
+             bonus=config.REFERRAL_BONUS,
+             bot=config.BOT_USERNAME,
+             code=user.get("referral_code", ""),
+             count=ref_count)
+    await q.edit_message_text(
+        text, parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton(get_text("btn_back", lang(user)), callback_data="main_menu")
+        ]]),
+    )
 
-async def withdraw_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = update.effective_user
-    db_user = db.get_user(user.id)
-    lang = lang_of(db_user)
 
-    if not db_user["phone"]:
-        await safe_edit(query, get_text("withdraw_no_phone", lang), reply_markup=back_keyboard(lang))
-        return ConversationHandler.END
+# ── Deposit ConversationHandler ────────────────────────────────────────────────
 
-    if db_user["balance"] < config.MIN_WITHDRAWAL:
-        await safe_edit(
-            query, get_text("withdraw_insufficient", lang, balance=fmt(db_user["balance"])),
-            reply_markup=back_keyboard(lang),
+async def deposit_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    tg = update.effective_user
+    user = await db.get_user(tg.id)
+    amounts_row = [InlineKeyboardButton(str(a), callback_data=f"dep_amt:{a}")
+                   for a in [50, 100, 200, 500]]
+    markup = InlineKeyboardMarkup([
+        amounts_row,
+        [InlineKeyboardButton(get_text("btn_back", lang(user)), callback_data="main_menu")],
+    ])
+    await q.edit_message_text(
+        t("deposit_choose_amount", user, min=config.MIN_DEPOSIT),
+        parse_mode=ParseMode.HTML, reply_markup=markup,
+    )
+    return DEPOSIT_AMOUNT
+
+
+async def deposit_amount_selected(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    amount = float(q.data.split(":")[1])
+    return await _send_deposit_instructions(update, ctx, amount)
+
+
+async def deposit_amount_typed(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    tg = update.effective_user
+    user = await db.get_user(tg.id)
+    text = (update.message.text or "").strip()
+    try:
+        amount = float(text)
+        if amount < config.MIN_DEPOSIT:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(
+            t("invalid_amount", user, min=config.MIN_DEPOSIT), parse_mode=ParseMode.HTML
         )
+        return DEPOSIT_AMOUNT
+    return await _send_deposit_instructions(update, ctx, amount)
+
+
+async def _send_deposit_instructions(update, ctx, amount: float) -> int:
+    tg = update.effective_user if update.effective_user else update.callback_query.from_user
+    user = await db.get_user(tg.id)
+    acct = await db.get_active_deposit_account()
+    if not acct:
+        await (update.message or update.callback_query).reply_text("No deposit accounts configured. Contact support.")
         return ConversationHandler.END
 
-    await safe_edit(query, get_text("withdraw_start", lang, balance=fmt(db_user["balance"]), phone=db_user["phone"], min=fmt(config.MIN_WITHDRAWAL)))
+    ctx.user_data["deposit_amount"] = amount
+    ctx.user_data["deposit_account_id"] = acct["id"]
+
+    text = t("deposit_instructions", user,
+             amount=amount, account_phone=acct["phone"], account_name=acct["name"])
+    send = update.message.reply_text if update.message else update.callback_query.message.reply_text
+    await send(text, parse_mode=ParseMode.HTML)
+    return DEPOSIT_SMS
+
+
+async def deposit_sms_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    tg = update.effective_user
+    user = await db.get_user(tg.id)
+    sms_text = (update.message.text or "").strip()
+
+    await update.message.reply_text(t("deposit_verifying", user))
+
+    parsed = parse_telebirr_sms(sms_text)
+    if not parsed:
+        await update.message.reply_text(t("deposit_failed_parse", user))
+        return DEPOSIT_SMS
+
+    if not verify_recipient(parsed, config.ACCEPTED_RECIPIENT_NAMES, config.ACCEPTED_PHONE_LAST4):
+        await update.message.reply_text(t("deposit_failed_recipient", user))
+        return DEPOSIT_SMS
+
+    req_amount = ctx.user_data.get("deposit_amount", 0)
+    if not verify_amount(parsed, req_amount):
+        await update.message.reply_text(
+            t("deposit_failed_amount", user, sms_amount=parsed.amount, req_amount=req_amount)
+        )
+        return DEPOSIT_SMS
+
+    if await db.is_ref_used(parsed.reference):
+        await update.message.reply_text(t("deposit_duplicate_ref", user))
+        return DEPOSIT_SMS
+
+    await db.mark_ref_used(parsed.reference)
+    acct_id = ctx.user_data.get("deposit_account_id")
+    if acct_id:
+        await db.increment_account_deposits(acct_id)
+
+    new_bal = await db.add_balance(tg.id, parsed.amount, "deposit", parsed.reference)
+    await update.message.reply_text(
+        t("deposit_success", user, amount=parsed.amount, balance=round(new_bal, 2)),
+        parse_mode=ParseMode.HTML,
+    )
+    return ConversationHandler.END
+
+
+async def deposit_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    tg = update.effective_user
+    user = await db.get_user(tg.id)
+    (update.message or update.callback_query).reply_text(t("deposit_cancelled", user))
+    return ConversationHandler.END
+
+
+# ── Withdraw ConversationHandler ───────────────────────────────────────────────
+
+async def withdraw_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    tg = update.effective_user
+    user = await db.get_user(tg.id)
+    if not user.get("phone"):
+        await q.edit_message_text(t("withdraw_no_phone", user), parse_mode=ParseMode.HTML,
+                                   reply_markup=InlineKeyboardMarkup([[
+                                       InlineKeyboardButton(get_text("btn_back", lang(user)), callback_data="main_menu")
+                                   ]]))
+        return ConversationHandler.END
+    await q.edit_message_text(
+        t("withdraw_prompt", user,
+          phone=user["phone"],
+          balance=round(user["balance"], 2),
+          min=config.MIN_WITHDRAWAL),
+        parse_mode=ParseMode.HTML,
+    )
     return WITHDRAW_AMOUNT
 
 
-async def withdraw_amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    db_user = db.get_user(user.id)
-    lang = lang_of(db_user)
-    amount = safe_amount(update.message.text)
-
-    if amount is None:
-        await update.message.reply_text(get_text("withdraw_invalid_amount", lang))
+async def withdraw_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    tg = update.effective_user
+    user = await db.get_user(tg.id)
+    text = (update.message.text or "").strip()
+    try:
+        amount = float(text)
+        if amount < config.MIN_WITHDRAWAL:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(t("invalid_amount", user, min=config.MIN_WITHDRAWAL))
         return WITHDRAW_AMOUNT
 
-    if amount < config.MIN_WITHDRAWAL:
-        await update.message.reply_text(get_text("withdraw_below_min", lang, min=fmt(config.MIN_WITHDRAWAL)))
+    if user["balance"] < amount:
+        await update.message.reply_text(
+            t("insufficient_balance", user, need=amount, have=round(user["balance"], 2))
+        )
         return WITHDRAW_AMOUNT
 
-    if amount > db_user["balance"]:
-        await update.message.reply_text(get_text("withdraw_insufficient", lang, balance=fmt(db_user["balance"])))
-        return ConversationHandler.END
+    wd_id = await db.create_withdrawal(tg.id, amount, user["phone"])
+    await update.message.reply_text(t("withdraw_requested", user, amount=amount), parse_mode=ParseMode.HTML)
 
-    # Deduct balance immediately (atomic) so the same request can't be
-    # submitted twice before admin processes it. Withdrawals go to the
-    # user's REGISTERED phone (collected at /start) - never user-typed
-    # at this step, which removes the risk of funds being redirected to
-    # an unverified number.
-    new_balance = db.adjust_balance(user.id, -amount)
-    withdrawal_id = db.create_withdrawal(user.id, amount, db_user["phone"])
-    db.record_transaction(user.id, "withdraw", -amount, reference=f"withdraw_{withdrawal_id}", status="pending")
+    # Notify admin
+    await safe_send(ctx.bot, config.ADMIN_ID,
+                    f"💸 <b>New Withdrawal Request</b>\n"
+                    f"#{wd_id} | @{user.get('username') or 'N/A'} | "
+                    f"{amount} ETB → {user['phone']}",
+                    markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton(f"✅ Approve #{wd_id}", callback_data=f"wd_approve:{wd_id}"),
+                        InlineKeyboardButton(f"❌ Reject #{wd_id}", callback_data=f"wd_reject:{wd_id}"),
+                    ]]))
+    return ConversationHandler.END
 
+
+# ── Transfer ConversationHandler ───────────────────────────────────────────────
+
+async def transfer_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    tg = update.effective_user
+    user = await db.get_user(tg.id)
+    await q.edit_message_text(t("transfer_prompt_user", user), parse_mode=ParseMode.HTML)
+    return TRANSFER_USER
+
+
+async def transfer_user_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    tg = update.effective_user
+    user = await db.get_user(tg.id)
+    username = (update.message.text or "").strip().lstrip("@")
+    recipient = await db.get_user_by_username(username)
+    if not recipient:
+        await update.message.reply_text(t("transfer_user_not_found", user, username=username))
+        return TRANSFER_USER
+    if recipient["telegram_id"] == tg.id:
+        await update.message.reply_text(t("transfer_self", user))
+        return TRANSFER_USER
+    ctx.user_data["transfer_to"] = recipient
     await update.message.reply_text(
-        get_text("withdraw_submitted", lang, amount=fmt(amount), phone=db_user["phone"]),
-        parse_mode="HTML", reply_markup=main_menu_keyboard(lang),
+        t("transfer_prompt_amount", user,
+          min=config.MIN_TRANSFER, balance=round(user["balance"], 2)),
+        parse_mode=ParseMode.HTML,
     )
-
-    for admin_id in config.ADMIN_IDS:
-        try:
-            await context.bot.send_message(
-                chat_id=admin_id,
-                text=get_text(
-                    "withdraw_admin_notify", "en",
-                    id=withdrawal_id, user_id=user.id, username=html.escape(db_user["username"] or ""),
-                    amount=fmt(amount), phone=db_user["phone"],
-                    time=datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
-                ),
-                parse_mode="HTML", reply_markup=withdraw_approval_keyboard(withdrawal_id),
-            )
-        except Forbidden:
-            logger.warning(f"Could not notify admin {admin_id} - they may not have started the bot")
-
-    return ConversationHandler.END
-
-
-async def withdraw_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    db_user = db.get_user(update.effective_user.id)
-    lang = lang_of(db_user)
-    await update.message.reply_text(get_text("cancel", lang), reply_markup=ReplyKeyboardRemove())
-    return ConversationHandler.END
-
-
-async def admin_approve_withdrawal(query, context, withdrawal_id):
-    if query.from_user.id not in config.ADMIN_IDS:
-        await query.answer("Not authorized", show_alert=True)
-        return
-
-    withdrawal = db.get_withdrawal(withdrawal_id)
-    if withdrawal is None or withdrawal["status"] != "pending":
-        await query.answer("Already processed or not found", show_alert=True)
-        return
-
-    db.update_withdrawal_status(withdrawal_id, "approved")
-    await safe_edit(query, f"✅ Withdrawal #{withdrawal_id} approved.", parse_mode="HTML")
-
-    user = db.get_user(withdrawal["user_id"])
-    lang = lang_of(user) if user else config.DEFAULT_LANGUAGE
-    try:
-        await context.bot.send_message(
-            chat_id=withdrawal["user_id"],
-            text=get_text("withdraw_approved", lang, amount=fmt(withdrawal["amount"]), phone=withdrawal["phone"]),
-            parse_mode="HTML",
-        )
-    except Forbidden:
-        pass
-
-
-async def admin_reject_withdrawal(query, context, withdrawal_id):
-    if query.from_user.id not in config.ADMIN_IDS:
-        await query.answer("Not authorized", show_alert=True)
-        return
-
-    withdrawal = db.get_withdrawal(withdrawal_id)
-    if withdrawal is None or withdrawal["status"] != "pending":
-        await query.answer("Already processed or not found", show_alert=True)
-        return
-
-    # Refund the user since the withdrawal was rejected
-    db.adjust_balance(withdrawal["user_id"], withdrawal["amount"])
-    db.record_transaction(withdrawal["user_id"], "withdraw_refund", withdrawal["amount"], status="completed")
-    db.update_withdrawal_status(withdrawal_id, "rejected")
-    await safe_edit(query, f"❌ Withdrawal #{withdrawal_id} rejected and refunded.", parse_mode="HTML")
-
-    user = db.get_user(withdrawal["user_id"])
-    lang = lang_of(user) if user else config.DEFAULT_LANGUAGE
-    try:
-        await context.bot.send_message(
-            chat_id=withdrawal["user_id"],
-            text=get_text("withdraw_rejected", lang, amount=fmt(withdrawal["amount"])),
-            parse_mode="HTML",
-        )
-    except Forbidden:
-        pass
-
-
-# =====================================================================
-# TRANSFER FLOW (conversation, entry point = "menu_transfer" button)
-# =====================================================================
-
-async def transfer_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = update.effective_user
-    db_user = db.get_user(user.id)
-    lang = lang_of(db_user)
-
-    can, seconds_remaining = db.can_transfer(user.id)
-    if not can:
-        minutes_remaining = max(1, seconds_remaining // 60)
-        await safe_edit(
-            query, get_text("transfer_cooldown", lang, minutes=minutes_remaining),
-            reply_markup=back_keyboard(lang),
-        )
-        return ConversationHandler.END
-
-    if db_user["balance"] < config.MIN_TRANSFER:
-        await safe_edit(
-            query, get_text("transfer_insufficient", lang, balance=fmt(db_user["balance"])),
-            reply_markup=back_keyboard(lang),
-        )
-        return ConversationHandler.END
-
-    await safe_edit(query, get_text("transfer_start", lang, balance=fmt(db_user["balance"]), min=fmt(config.MIN_TRANSFER)))
-    return TRANSFER_USERNAME
-
-
-async def transfer_username_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    db_user = db.get_user(user.id)
-    lang = lang_of(db_user)
-    target_username = update.message.text.strip().lstrip("@")
-
-    target_row = db.find_user_by_username(target_username)
-
-    if target_row is None:
-        await update.message.reply_text(get_text("transfer_user_not_found", lang, username=html.escape(target_username)))
-        return TRANSFER_USERNAME
-
-    if target_row["user_id"] == user.id:
-        await update.message.reply_text(get_text("transfer_cannot_self", lang))
-        return TRANSFER_USERNAME
-
-    context.user_data["transfer_target_id"] = target_row["user_id"]
-    context.user_data["transfer_target_username"] = target_username
-    await update.message.reply_text(get_text("transfer_enter_amount", lang, to_username=html.escape(target_username), balance=fmt(db_user["balance"])))
     return TRANSFER_AMOUNT
 
 
-async def transfer_amount_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    db_user = db.get_user(user.id)
-    lang = lang_of(db_user)
-    amount = safe_amount(update.message.text)
-
-    target_id = context.user_data.get("transfer_target_id")
-    target_username = context.user_data.get("transfer_target_username", "")
-
-    if target_id is None:
-        await update.message.reply_text(get_text("error_generic", lang))
-        return ConversationHandler.END
-
-    if amount is None:
-        await update.message.reply_text(get_text("transfer_invalid_amount", lang))
-        return TRANSFER_AMOUNT
-
-    if amount < config.MIN_TRANSFER:
-        await update.message.reply_text(get_text("transfer_below_min", lang, min=fmt(config.MIN_TRANSFER)))
-        return TRANSFER_AMOUNT
-
-    success, reason = db.transfer_funds(user.id, target_id, amount)
-
-    if not success:
-        if reason == "insufficient_balance":
-            await update.message.reply_text(get_text("transfer_insufficient", lang))
-        else:
-            await update.message.reply_text(get_text("error_generic", lang))
-        return ConversationHandler.END
-
-    new_balance = db.get_balance(user.id)
-    await update.message.reply_text(
-        get_text("transfer_success", lang, amount=fmt(amount), to_username=html.escape(target_username), balance=fmt(new_balance)),
-        parse_mode="HTML", reply_markup=main_menu_keyboard(lang),
-    )
-
-    target_user = db.get_user(target_id)
-    target_lang = lang_of(target_user) if target_user else config.DEFAULT_LANGUAGE
+async def transfer_amount_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    tg = update.effective_user
+    user = await db.get_user(tg.id)
+    text = (update.message.text or "").strip()
     try:
-        await context.bot.send_message(
-            chat_id=target_id,
-            text=get_text(
-                "transfer_received", target_lang, amount=fmt(amount),
-                from_username=html.escape(db_user["username"] or str(user.id)),
-                balance=fmt(db.get_balance(target_id)),
-            ),
-            parse_mode="HTML",
-        )
-    except Forbidden:
-        pass
+        amount = float(text)
+        if amount < config.MIN_TRANSFER:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(t("invalid_amount", user, min=config.MIN_TRANSFER))
+        return TRANSFER_AMOUNT
 
-    context.user_data.pop("transfer_target_id", None)
-    context.user_data.pop("transfer_target_username", None)
-    return ConversationHandler.END
-
-
-async def transfer_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    db_user = db.get_user(update.effective_user.id)
-    lang = lang_of(db_user)
-    await update.message.reply_text(get_text("cancel", lang), reply_markup=ReplyKeyboardRemove())
-    return ConversationHandler.END
-
-
-# =====================================================================
-# ADMIN PANEL
-# =====================================================================
-
-async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in config.ADMIN_IDS:
-        return
-    await update.message.reply_text("🛠️ <b>Admin Panel</b>", parse_mode="HTML", reply_markup=admin_menu_keyboard())
-
-
-async def admin_callback(query, context, db_user, data):
-    if query.from_user.id not in config.ADMIN_IDS:
-        await query.answer("Not authorized", show_alert=True)
-        return
-
-    if data == "admin_dashboard":
-        await admin_show_dashboard(query)
-    elif data == "admin_withdrawals":
-        await admin_show_withdrawals(query, context)
-    elif data == "admin_accounts":
-        await admin_show_accounts(query)
-    elif data == "admin_house":
-        await admin_show_house(query)
-    elif data.startswith("admin_acc_remove_"):
-        acc_id = int(data.rsplit("_", 1)[1])
-        db.remove_deposit_account(acc_id)
-        await admin_show_accounts(query)
-    elif data == "admin_back":
-        await query.edit_message_text("🛠️ <b>Admin Panel</b>", parse_mode="HTML", reply_markup=admin_menu_keyboard())
-    # Note: "admin_broadcast" and "admin_acc_add" are NOT handled here -
-    # they are ConversationHandler entry points (see admin_broadcast_entry
-    # and admin_add_account_entry) registered separately in main(), since
-    # this function is invoked from a plain CallbackQueryHandler whose
-    # return value cannot start a conversation state.
-
-
-async def admin_show_dashboard(query):
-    total_games = db.get_total_games_played()
-    total_collected = db.get_total_collected()
-    net_profit = db.get_house_total_earned()
-    total_players = db.get_total_unique_players()
-    total_users = db.count_users()
-    peak_hours = db.get_peak_hours()
-
-    peak_summary = ", ".join(f"{h}:00 ({c})" for h, c in sorted(peak_hours, key=lambda x: -x[1])[:3]) or "No data yet"
-
-    text = (
-        "📊 <b>Dashboard</b>\n\n"
-        f"🎮 Total games played: <b>{total_games}</b>\n"
-        f"💰 Total deposited: <b>{fmt(total_collected)} ETB</b>\n"
-        f"🏛️ Net house profit: <b>{fmt(net_profit)} ETB</b>\n"
-        f"👥 Total registered users: <b>{total_users}</b>\n"
-        f"🎯 Unique bingo players: <b>{total_players}</b>\n\n"
-        f"⏰ Top 3 peak hours (UTC): {peak_summary}"
-    )
-    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_back")]]))
-
-
-async def admin_show_withdrawals(query, context):
-    pending = db.get_pending_withdrawals()
-    if not pending:
-        await safe_edit(query, "💸 No pending withdrawals.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_back")]]))
-        return
-
-    for w in pending[:10]:  # cap to avoid flooding the admin chat
-        user = db.get_user(w["user_id"])
-        username = user["username"] if user else str(w["user_id"])
-        text = (
-            f"🔔 <b>Withdrawal #{w['id']}</b>\n"
-            f"👤 User: {w['user_id']} (@{html.escape(username or '')})\n"
-            f"📱 Phone: {w['phone']}\n"
-            f"💰 Amount: <b>{fmt(w['amount'])} ETB</b>\n"
-            f"🕐 {w['created_at'][:16].replace('T', ' ')}"
-        )
-        await context.bot.send_message(
-            chat_id=query.from_user.id, text=text, parse_mode="HTML",
-            reply_markup=withdraw_approval_keyboard(w["id"]),
-        )
-    await query.answer(f"{len(pending)} pending withdrawal(s) sent above.")
-
-
-async def admin_show_accounts(query):
-    accounts = db.list_deposit_accounts()
-    lines = ["🏦 <b>Deposit Accounts</b>\n"]
-    rows = []
-    for acc in accounts:
-        marker = "🟢 ACTIVE" if acc["active"] else "⚪"
-        lines.append(f"{marker} #{acc['id']}: {acc['phone']} ({html.escape(acc['recipient_name'])}) - {acc['deposit_count']}/{config.ROTATE_AFTER_DEPOSITS} deposits")
-        rows.append([InlineKeyboardButton(f"🗑️ Remove #{acc['id']}", callback_data=f"admin_acc_remove_{acc['id']}")])
-
-    rows.append([InlineKeyboardButton("➕ Add Account", callback_data="admin_acc_add")])
-    rows.append([InlineKeyboardButton("🔙 Back", callback_data="admin_back")])
-
-    await safe_edit(query, "\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
-
-
-async def admin_show_house(query):
-    balance = db.get_house_balance()
-    total_earned = db.get_house_total_earned()
-    text = (
-        "🏛️ <b>House Wallet</b>\n\n"
-        f"💰 Current balance: <b>{fmt(balance)} ETB</b>\n"
-        f"📈 Total earned (all-time): <b>{fmt(total_earned)} ETB</b>"
-    )
-    await safe_edit(query, text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_back")]]))
-
-
-async def admin_add_account_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    phone = update.message.text.strip()
-    context.user_data["new_account_phone"] = phone
-    await update.message.reply_text("👤 Send the recipient name exactly as it appears in YOUR Telebirr SMS:")
-    return ADMIN_ADD_ACCOUNT_NAME
-
-
-async def admin_add_account_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = update.message.text.strip()
-    phone = context.user_data.pop("new_account_phone", None)
-    if phone is None:
-        await update.message.reply_text("Something went wrong, please start over with /admin.")
+    # Cooldown check
+    elapsed = time.time() - (user.get("last_transfer_at") or 0)
+    if elapsed < config.TRANSFER_COOLDOWN_SECONDS:
+        mins = int((config.TRANSFER_COOLDOWN_SECONDS - elapsed) / 60) + 1
+        await update.message.reply_text(t("transfer_cooldown", user, mins=mins))
         return ConversationHandler.END
 
-    acc_id = db.add_deposit_account(phone, name)
-    await update.message.reply_text(f"✅ Account #{acc_id} added: {phone} ({name})", reply_markup=admin_menu_keyboard())
+    to = ctx.user_data.get("transfer_to")
+    if not to:
+        return ConversationHandler.END
+
+    ok, err = await db.transfer_balance(tg.id, to["telegram_id"], amount)
+    if not ok:
+        await update.message.reply_text(t("insufficient_balance", user,
+                                          need=amount, have=round(user["balance"], 2)))
+        return ConversationHandler.END
+
+    user = await db.get_user(tg.id)
+    await update.message.reply_text(
+        t("transfer_success", user, amount=amount,
+          to=to.get("username") or to["telegram_id"],
+          balance=round(user["balance"], 2)),
+        parse_mode=ParseMode.HTML,
+    )
+    # Notify recipient
+    to_user = await db.get_user(to["telegram_id"])
+    if to_user:
+        await safe_send(ctx.bot, to["telegram_id"],
+                        t("transfer_received", to_user, amount=amount,
+                          from_user=user.get("username") or tg.id))
     return ConversationHandler.END
 
 
-async def admin_broadcast_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    all_ids = db.get_all_user_ids()
-    sent, failed = 0, 0
+# ── Admin handlers ─────────────────────────────────────────────────────────────
 
-    for uid in all_ids:
+async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    tg = update.effective_user
+    if tg.id != config.ADMIN_ID:
+        await update.message.reply_text("❌ Unauthorized")
+        return
+    stats = await db.get_stats()
+    text = (f"⚙️ <b>Admin Panel</b>\n\n"
+            f"👥 Users: {stats['users']}\n"
+            f"🎮 Games: {stats['games']}\n"
+            f"💵 Collected: {stats['collected']} ETB\n"
+            f"🏦 Profit: {stats['profit']} ETB\n"
+            f"💸 Pending WDs: {stats['pending_wd']}")
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💸 Withdrawals", callback_data="admin_wds"),
+         InlineKeyboardButton("🏦 Accounts", callback_data="admin_accounts")],
+        [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"),
+         InlineKeyboardButton("📊 Stats", callback_data="admin_stats")],
+    ])
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+
+async def admin_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    tg = update.effective_user
+    if tg.id != config.ADMIN_ID:
+        return ConversationHandler.END
+
+    data = q.data
+    if data == "admin_stats":
+        stats = await db.get_stats()
+        await q.edit_message_text(
+            f"📊 Users: {stats['users']} | Games: {stats['games']}\n"
+            f"Collected: {stats['collected']} ETB | Profit: {stats['profit']} ETB",
+            parse_mode=ParseMode.HTML,
+        )
+    elif data == "admin_wds":
+        wds = await db.get_pending_withdrawals()
+        if not wds:
+            await q.edit_message_text("✅ No pending withdrawals.")
+            return ConversationHandler.END
+        rows = []
+        for wd in wds:
+            rows.append([
+                InlineKeyboardButton(
+                    f"✅ #{wd['id']} {wd['amount']} ETB @{wd.get('username','?')}",
+                    callback_data=f"wd_approve:{wd['id']}"
+                ),
+                InlineKeyboardButton("❌", callback_data=f"wd_reject:{wd['id']}"),
+            ])
+        await q.edit_message_text("💸 Pending Withdrawals:", reply_markup=InlineKeyboardMarkup(rows))
+    elif data.startswith("wd_approve:"):
+        wd_id = int(data.split(":")[1])
+        wd = await db.approve_withdrawal(wd_id)
+        if wd:
+            await q.edit_message_text(f"✅ Withdrawal #{wd_id} approved. Send {wd['amount']} ETB → {wd['phone']}")
+            notif_user = await db.get_user(wd["telegram_id"])
+            if notif_user:
+                await safe_send(ctx.bot, wd["telegram_id"],
+                                get_text("withdrawal_notify_approved", lang(notif_user), amount=wd["amount"]))
+    elif data.startswith("wd_reject:"):
+        wd_id = int(data.split(":")[1])
+        wd = await db.reject_withdrawal(wd_id)
+        if wd:
+            await q.edit_message_text(f"❌ Withdrawal #{wd_id} rejected. {wd['amount']} ETB refunded.")
+            notif_user = await db.get_user(wd["telegram_id"])
+            if notif_user:
+                await safe_send(ctx.bot, wd["telegram_id"],
+                                get_text("withdrawal_notify_rejected", lang(notif_user), amount=wd["amount"]))
+    elif data == "admin_broadcast":
+        await q.edit_message_text("📢 Send your broadcast message now (text or photo):")
+        return ADMIN_BROADCAST
+    elif data == "admin_accounts":
+        accts = await db.get_deposit_accounts()
+        lines = ["🏦 <b>Deposit Accounts</b>"]
+        for a in accts:
+            status = "✅" if a["is_active"] else "❌"
+            lines.append(f"{status} #{a['id']} {a['name']} | {a['phone']} (deposits: {a['deposit_count']})")
+        lines.append("\nSend <code>phone|name</code> to add or <code>remove:ID</code> to remove:")
+        await q.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        return ADMIN_ACCOUNTS
+    return ConversationHandler.END
+
+
+async def admin_broadcast_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_user.id != config.ADMIN_ID:
+        return ConversationHandler.END
+    all_tids = await db.get_all_user_tids()
+    count = 0
+    for tid in all_tids:
         try:
             if update.message.photo:
-                await context.bot.send_photo(
-                    chat_id=uid, photo=update.message.photo[-1].file_id,
-                    caption=update.message.caption or "",
-                )
+                await ctx.bot.send_photo(tid, update.message.photo[-1].file_id,
+                                          caption=update.message.caption or "")
             else:
-                await context.bot.send_message(chat_id=uid, text=update.message.text)
-            sent += 1
-        except Forbidden:
-            failed += 1
+                await ctx.bot.send_message(tid, update.message.text or "",
+                                            parse_mode=ParseMode.HTML)
+            count += 1
         except Exception:
-            failed += 1
-        await asyncio.sleep(0.05)  # gentle throttle to avoid Telegram flood limits
-
-    await update.message.reply_text(f"📢 Broadcast sent to {sent} users ({failed} failed/blocked).")
+            pass
+        await asyncio.sleep(0.05)  # Rate limit
+    await update.message.reply_text(f"✅ Broadcast sent to {count} users.")
     return ConversationHandler.END
 
 
-async def admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Cancelled.", reply_markup=ReplyKeyboardRemove())
+async def admin_accounts_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_user.id != config.ADMIN_ID:
+        return ConversationHandler.END
+    text = (update.message.text or "").strip()
+    if text.startswith("remove:"):
+        acct_id = int(text.split(":")[1])
+        await db.remove_deposit_account(acct_id)
+        await update.message.reply_text(f"✅ Account #{acct_id} deactivated.")
+    elif "|" in text:
+        parts = text.split("|", 1)
+        phone, name = parts[0].strip(), parts[1].strip()
+        new_id = await db.add_deposit_account(phone, name)
+        await update.message.reply_text(f"✅ Account #{new_id} added: {name} ({phone})")
+    else:
+        await update.message.reply_text("Invalid format. Use phone|name or remove:ID")
     return ConversationHandler.END
 
 
-async def admin_broadcast_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.from_user.id not in config.ADMIN_IDS:
-        await query.answer("Not authorized", show_alert=True)
-        return ConversationHandler.END
-    await query.edit_message_text("📢 Send me the message (text/photo) to broadcast to all users, or /cancel.")
-    return ADMIN_BROADCAST_WAIT
+# ── Error handler ──────────────────────────────────────────────────────────────
+
+async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Exception:", exc_info=ctx.error)
 
 
-async def admin_add_account_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.from_user.id not in config.ADMIN_IDS:
-        await query.answer("Not authorized", show_alert=True)
-        return ConversationHandler.END
-    await query.edit_message_text("📱 Send the new account's phone number (e.g. 0911223344):")
-    return ADMIN_ADD_ACCOUNT_PHONE
+# ── Application setup & main ───────────────────────────────────────────────────
 
+def build_app() -> Application:
+    app = ApplicationBuilder().token(config.BOT_TOKEN).build()
 
-# =====================================================================
-# MAIN
-# =====================================================================
-
-def main():
-    db.init_db()
-
-    application = Application.builder().token(config.BOT_TOKEN).build()
-
-    # ---- /start + phone collection conversation ----
-    start_conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+    # ── Registration conversation ──
+    reg_conv = ConversationHandler(
+        entry_points=[CommandHandler("start", cmd_start)],
         states={
-            PHONE_COLLECT: [MessageHandler(filters.CONTACT, phone_received)],
+            PHONE_INPUT: [
+                MessageHandler(filters.CONTACT, handle_contact),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_plain_phone),
+            ],
         },
-        fallbacks=[CommandHandler("start", start)],
-        name="start_conv",
+        fallbacks=[CommandHandler("start", cmd_start)],
+        per_message=False,
     )
+    app.add_handler(reg_conv)
 
-    # ---- Deposit custom-amount conversation ----
+    # ── Deposit conversation ──
     deposit_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(deposit_amount_chosen, pattern="^depamt_custom$")],
+        entry_points=[CallbackQueryHandler(deposit_start, pattern="^deposit$")],
         states={
-            DEPOSIT_CUSTOM_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, custom_deposit_amount_received)],
+            DEPOSIT_AMOUNT: [
+                CallbackQueryHandler(deposit_amount_selected, pattern=r"^dep_amt:"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, deposit_amount_typed),
+            ],
+            DEPOSIT_SMS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, deposit_sms_received),
+            ],
         },
-        fallbacks=[CommandHandler("cancel", withdraw_cancel)],
-        name="deposit_conv",
+        fallbacks=[CallbackQueryHandler(deposit_cancel, pattern="^main_menu$")],
+        per_message=False,
     )
+    app.add_handler(deposit_conv)
 
-    # ---- Withdrawal conversation ----
-    withdraw_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(withdraw_start, pattern="^menu_withdraw$")],
+    # ── Withdraw conversation ──
+    wd_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(withdraw_start, pattern="^withdraw$")],
         states={
-            WITHDRAW_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_amount_received)],
+            WITHDRAW_AMOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_amount),
+            ],
         },
-        fallbacks=[CommandHandler("cancel", withdraw_cancel)],
-        name="withdraw_conv",
+        fallbacks=[],
+        per_message=False,
     )
+    app.add_handler(wd_conv)
 
-    # ---- Transfer conversation ----
-    transfer_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(transfer_start, pattern="^menu_transfer$")],
+    # ── Transfer conversation ──
+    tr_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(transfer_start, pattern="^transfer$")],
         states={
-            TRANSFER_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, transfer_username_received)],
-            TRANSFER_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, transfer_amount_received)],
+            TRANSFER_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, transfer_user_input)],
+            TRANSFER_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, transfer_amount_input)],
         },
-        fallbacks=[CommandHandler("cancel", transfer_cancel)],
-        name="transfer_conv",
+        fallbacks=[],
+        per_message=False,
     )
+    app.add_handler(tr_conv)
 
-    # ---- Admin panel conversation (broadcast + add account need free-text input) ----
+    # ── Admin conversation ──
     admin_conv = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(admin_broadcast_entry, pattern="^admin_broadcast$"),
-            CallbackQueryHandler(admin_add_account_entry, pattern="^admin_acc_add$"),
-        ],
+        entry_points=[CallbackQueryHandler(admin_callback, pattern="^admin_")],
         states={
-            ADMIN_BROADCAST_WAIT: [MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, admin_broadcast_received)],
-            ADMIN_ADD_ACCOUNT_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_account_phone)],
-            ADMIN_ADD_ACCOUNT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_account_name)],
+            ADMIN_BROADCAST: [MessageHandler(filters.ALL & ~filters.COMMAND, admin_broadcast_message)],
+            ADMIN_ACCOUNTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_accounts_message)],
         },
-        fallbacks=[CommandHandler("cancel", admin_cancel)],
-        name="admin_conv",
+        fallbacks=[],
+        per_message=False,
     )
+    app.add_handler(admin_conv)
 
-    application.add_handler(start_conv)
-    application.add_handler(CommandHandler("admin", admin_command))
+    # ── Admin withdrawal approve/reject (outside conv) ──
+    app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^wd_(approve|reject):"))
 
-    # Conversation handlers MUST be registered before the generic
-    # menu_callback CallbackQueryHandler below, so their entry-point
-    # patterns (menu_withdraw, menu_transfer, depamt_custom, admin_*)
-    # are claimed by the conversation first. python-telegram-bot tries
-    # handlers in registration order within the default group and stops
-    # at the first one whose filter matches, so order here is load-bearing.
-    application.add_handler(deposit_conv)
-    application.add_handler(withdraw_conv)
-    application.add_handler(transfer_conv)
-    application.add_handler(admin_conv)
+    # ── Main callback handler ──
+    app.add_handler(CallbackQueryHandler(handle_callback))
 
-    # Generic menu/game/admin-readonly callback router (catches everything
-    # NOT claimed by a conversation entry point above).
-    application.add_handler(CallbackQueryHandler(menu_callback))
+    # ── Admin command ──
+    app.add_handler(CommandHandler("admin", cmd_admin))
 
-    # Free-text messages not part of any conversation - checked for
-    # "looks like a pasted Telebirr SMS".
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_possible_sms))
+    app.add_error_handler(error_handler)
+    return app
 
-    logger.info("Habesha Bet bot starting...")
-    application.run_polling()
+
+async def main() -> None:
+    await db.init_db()
+    _init_all_rooms()
+
+    app = build_app()
+
+    # Restore active game state from DB on startup
+    for fee in config.ROOM_FEES:
+        g_row = await db.get_active_game(fee)
+        if g_row:
+            GAMES[fee]["game_id"] = g_row["id"]
+            GAMES[fee]["status"] = g_row["status"]
+            GAMES[fee]["prize_pool"] = g_row["prize_pool"]
+            # Reload called numbers
+            GAMES[fee]["called_numbers"] = json.loads(g_row["called_numbers"] or "[]")
+            # Reload card owners
+            GAMES[fee]["card_owners"] = await db.get_card_owners(g_row["id"])
+            # Reload card grids
+            cards = generate_unique_cards(config.TOTAL_CARDS, seed=g_row["id"] * 1000 + fee)
+            GAMES[fee]["all_card_grids"] = {i + 1: cards[i] for i in range(config.TOTAL_CARDS)}
+        else:
+            await ensure_game_for_room(app, fee)
+
+    logger.info("Habesha Bet Bingo Bot starting...")
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+    await asyncio.Event().wait()  # Run forever
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

@@ -570,11 +570,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def _find_user_by_ref(code: str):
-    import aiosqlite as _aiosqlite
-    async with await db._conn() as conn:
-        return db._row(await conn.execute_fetchone(
-            "SELECT * FROM users WHERE referral_code=?", (code,)
-        ))
+    return await db.find_user_by_ref_code(code)
 
 
 async def handle_contact(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:

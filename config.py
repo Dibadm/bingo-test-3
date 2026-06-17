@@ -1,102 +1,62 @@
-# config.py
-# ============================================
-# HABESHA BET - MULTIPLAYER BINGO BOT CONFIG
-# Fill in the values marked "FILL IN" before running.
-# ============================================
+"""
+config.py — All settings, constants, and tunable parameters.
+"""
+import os
+from dotenv import load_dotenv
 
-# ---------- TELEGRAM CORE ----------
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"          # FILL IN - from @BotFather
-ADMIN_IDS = [123456789]                     # FILL IN - list of Telegram user IDs allowed to use /admin
-BOT_USERNAME = "your_bot_username"          # FILL IN - without @, used for referral links
-SUPPORT_USERNAME = "your_support_username"  # FILL IN - shown on "Contact Us" button
-GROUP_LINK = "https://t.me/your_group"      # FILL IN - shown on "Join Group" button
+load_dotenv()
 
-# ---------- DATABASE ----------
-DB_PATH = "habesha_bet.db"
+# ── Bot credentials ────────────────────────────────────────────────────────────
+BOT_TOKEN: str = os.getenv("HABESHA_BOT_TOKEN", "")
+ADMIN_ID: int = int(os.getenv("HABESHA_ADMIN_ID", "0"))
 
-# ---------- LANGUAGE ----------
-DEFAULT_LANGUAGE = "am"   # "am" (Amharic) or "en" (English)
+# ── Rooms ──────────────────────────────────────────────────────────────────────
+ROOM_FEES: list[int] = [10, 20, 50, 100]        # ETB entry fees
 
-# ============================================
-# BINGO ROOMS
-# ============================================
-# 4 permanent rooms, always available.
-ROOM_FEES = [10, 20, 50, 100]   # ETB entry fee per card
+# ── Card pool ─────────────────────────────────────────────────────────────────
+TOTAL_CARDS: int = 200                           # cards available per game
+MAX_CARDS_PER_PLAYER: int = 5                    # max a single player may buy
 
-CARD_POOL_SIZE = 200             # cards per room
-MAX_CARDS_PER_PLAYER = 5         # max cards a single player can buy in one room
+# ── Timing ─────────────────────────────────────────────────────────────────────
+COUNTDOWN_SECONDS: int = 60                      # lobby countdown before start
+CALL_INTERVAL_SECONDS: float = 2.0              # pause between number calls
+MIN_CARDS_TO_START: int = 2                      # cards sold before countdown
 
-MIN_CARDS_TO_START = 2           # minimum cards sold before a game can start
-COUNTDOWN_SECONDS = 60           # lobby countdown before game starts
+# ── Finance ────────────────────────────────────────────────────────────────────
+HOUSE_COMMISSION: float = 0.20                   # 20 % of total pot
+MIN_DEPOSIT: int = 20                            # ETB
+MIN_WITHDRAWAL: int = 30                         # ETB
+MIN_TRANSFER: int = 10                           # ETB
+TRANSFER_COOLDOWN_SECONDS: int = 3_600           # 1 hour
 
-CALL_DELAY_SECONDS = 2           # seconds between number calls
-MAX_NUMBERS_CALLED = 75          # call all 75 balls maximum
+# ── Deposit account rotation ───────────────────────────────────────────────────
+DEPOSITS_PER_ROTATION: int = 20                  # rotate after N successful deposits
 
-# ---------- PRIZE SPLIT ----------
-HOUSE_COMMISSION_PERCENT = 20    # house keeps 20% of the pool
-# Remaining 80% is split equally among all winners of that round
+# ── Telebirr SMS verification ─────────────────────────────────────────────────
+# Accepted recipient name fragments (lowercase, partial match OK)
+ACCEPTED_RECIPIENT_NAMES: list[str] = ["habesha bet", "habeshabet"]
+# Last 4 digits of the accepted Telebirr phone numbers
+ACCEPTED_PHONE_LAST4: list[str] = ["6789", "1234"]   # update to real digits
 
-# ---------- WIN TYPES ----------
-# Only "line" (row/column/diagonal) and "corners" count as valid wins.
-# Full House is intentionally NOT a separate win condition.
-ENABLE_LINE_WIN = True
-ENABLE_CORNERS_WIN = True
-ENABLE_FULL_HOUSE_WIN = False
+# ── Referral ───────────────────────────────────────────────────────────────────
+REFERRAL_BONUS: float = 5.0                      # ETB reward for both parties
 
-# ============================================
-# DEPOSITS (TELEBIRR)
-# ============================================
-# Multiple Telebirr accounts can be configured; the active account
-# rotates automatically after ROTATE_AFTER_DEPOSITS successful deposits.
-# Accounts themselves are stored in the database (deposit_accounts table)
-# so the admin can add/remove them live via /admin without redeploying.
-ROTATE_AFTER_DEPOSITS = 20
+# ── Default Telebirr deposit accounts (admin can add more via /admin) ──────────
+DEFAULT_TELEBIRR_ACCOUNTS: list[dict] = [
+    {"phone": "0912346789", "name": "Habesha Bet"},
+]
 
-MIN_DEPOSIT = 20      # ETB
-DEPOSIT_QUICK_AMOUNTS = [50, 100, 200, 500, 1000]   # quick-select buttons; "Custom" always also offered
+# ── Database ───────────────────────────────────────────────────────────────────
+DB_PATH: str = os.path.join(os.path.dirname(__file__), "habesha_bingo.db")
 
-# ============================================
-# WITHDRAWALS
-# ============================================
-MIN_WITHDRAWAL = 30   # ETB
+# ── Audio ──────────────────────────────────────────────────────────────────────
+AUDIO_DIR: str = os.path.join(os.path.dirname(__file__), "audio")
+# Place files named 1.ogg … 75.ogg inside the audio/ folder.
 
-# ============================================
-# TRANSFERS (user to user)
-# ============================================
-MIN_TRANSFER = 10                # ETB
-TRANSFER_COOLDOWN_SECONDS = 3600  # 1 hour between transfers per user
+# ── Community ──────────────────────────────────────────────────────────────────
+GROUP_LINK: str = os.getenv("HABESHA_GROUP_LINK", "https://t.me/your_group")
+CONTACT_USERNAME: str = os.getenv("HABESHA_CONTACT", "@your_support")
+BOT_USERNAME: str = os.getenv("HABESHA_BOT_USERNAME", "your_bot")
 
-# ============================================
-# REFERRAL & BONUS SETTINGS
-# ============================================
-REFERRAL_BONUS = 10          # ETB to referrer when their friend makes a first deposit
-SIGNUP_BONUS = 5             # ETB to a new user who joined via a referral link
-DAILY_BONUS_AMOUNT = 5       # ETB
-DAILY_BONUS_COOLDOWN_HOURS = 24
-
-# ============================================
-# AUDIO (Amharic voice announcements)
-# ============================================
-# If a file named "{number}.ogg" exists in AUDIO_DIR (e.g. "12.ogg"),
-# the bot sends it as a voice note when that number is called.
-# If the file does not exist, the bot falls back to text-only.
-# English audio is intentionally NOT supported - Amharic only.
-AUDIO_DIR = "audio"
-ENABLE_VOICE_ANNOUNCEMENTS = True
-
-# ============================================
-# HOUSE WALLET
-# ============================================
-# House commission is tracked in its own dedicated `house_wallet` table
-# (balance = withdrawable now, total_earned = cumulative all-time).
-# This ID is unused by the table design but kept reserved in case a
-# pseudo-user representation is ever needed elsewhere.
-HOUSE_ACCOUNT_ID = 0
-
-
-# ============================================
-# MASKING (for "last buyer" display, winner display, etc.)
-# ============================================
-# e.g. "@fUCijZmjgEq" -> "@fUC***" or "Abdi Mohammed" -> "@Ab8***"
-MASK_VISIBLE_CHARS = 3
-
+# ── UI helpers ─────────────────────────────────────────────────────────────────
+CARDS_PER_PAGE: int = 50          # cards shown per page in card-selection grid

@@ -32,11 +32,9 @@ jobs:
         run: npm install
 
       - name: Build Project
-        run: npm run build -- --allow-empty-components || true
+        run: npx vite build
         env:
           VITE_API_URL: ${{ vars.VITE_API_URL }}
-          VITE_SKIP_TYPECHECK: true
-          TSC_COMPILE_ON_ERROR: "true"
 
       - name: Setup Pages
         uses: actions/configure-pages@v4

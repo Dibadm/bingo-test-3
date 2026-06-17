@@ -1,9 +1,9 @@
-```yaml
 name: Deploy React WebApp to GitHub Pages
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
 
 permissions:
   contents: read

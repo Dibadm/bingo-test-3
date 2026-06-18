@@ -3,7 +3,7 @@ import react from '@vitejs/plugin-react';
 
 export default defineConfig({
   plugins: [react()],
-  base: '/bingo-test-3/', // 👈 CHANGE THIS LINE HERE
+  base: '/', // 👈 CHANGE THIS BACK TO A SINGLE SLASH
   build: {
     outDir: 'dist',
     emptyOutDir: true,
